@@ -1,0 +1,75 @@
+1
+00:00:00,040 --> 00:00:03,210
+Something’s uploading from your PC. Do you know what?
+
+2
+00:00:04,040 --> 00:00:08,245
+Follow the upload rate to Demo Uploader. The decoded request identifies our
+
+3
+00:00:08,245 --> 00:00:09,297
+controlled test endpoint.
+
+4
+00:00:10,040 --> 00:00:13,881
+The Inspector connects the traffic to the program’s identity, connections, and decoded
+
+5
+00:00:13,881 --> 00:00:17,081
+request metadata. Here, the host is our local test server.
+
+6
+00:00:18,040 --> 00:00:21,930
+Save a per-process packet capture, so the investigation leaves evidence you can
+
+7
+00:00:21,930 --> 00:00:22,579
+examine later.
+
+8
+00:00:23,040 --> 00:00:26,675
+Block the test uploader through an approved client. New connection attempts fail,
+
+9
+00:00:26,675 --> 00:00:29,099
+and the test endpoint receives no fresh data.
+
+10
+00:00:32,040 --> 00:00:35,612
+Sentinel can take this further. Its daemon scores activity and gives A
+
+11
+00:00:35,612 --> 00:00:37,993
+I a focused case, with the evidence attached.
+
+12
+00:00:39,040 --> 00:00:43,174
+Here’s a simulated example: an unsigned program in Downloads, with a URL
+
+13
+00:00:43,174 --> 00:00:46,963
+in its command line. Together, these signals trigger a closer investigation.
+
+14
+00:00:48,040 --> 00:00:52,813
+The investigator unpacks five small contacts, exactly thirty seconds apart. It correlates
+
+15
+00:00:52,813 --> 00:00:56,790
+identity, execution context, and timing, while considering a legitimate heartbeat.
+
+16
+00:00:57,040 --> 00:01:01,057
+The AI explains its concern, uncertainty, and next checks. Dry run
+
+17
+00:01:01,057 --> 00:01:04,740
+logs kill and block requests for review, without performing those actions.
+
+18
+00:01:05,040 --> 00:01:09,540
+Hodometer. Turn your AI into an actual system sentinel. See the
+
+19
+00:01:09,540 --> 00:01:11,790
+traffic. Follow the evidence. Take control.

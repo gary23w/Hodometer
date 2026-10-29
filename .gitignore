@@ -10,7 +10,11 @@ blocked.jsonl
 snapshot*.bmp
 snapshot*.png
 screenshot*.png
-capture_*.pcapng
+*.pcap
+*.pcapng
+*.cap
+*.etl
+*.dmp
 hodometer.log
 Hodometer-1.1-backup.exe
 Hodometer-1.2.exe
@@ -20,3 +24,6 @@ Hodometer.exe
 .claude/
 
 build/
+
+# Local video production, including private raw footage and intermediate exports
+/demo-video/

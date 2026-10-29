@@ -17,6 +17,16 @@ timestamp; a watcher can ask for decoded handshakes only instead of every frame;
 flow's SNI, ALPN, HTTP request or TLS version the moment it is decoded; each connection may watch 64 processes;
 `inspect` reports the file's SHA-256 and caches signature checks.
 
+## Demo
+
+[![Turn your AI into an actual system sentinel — watch the Hodometer demo](docs/demo/hodometer-demo-preview.jpg)](docs/demo/hodometer-demo.mp4)
+
+**[Watch or download the 72-second demo](docs/demo/hodometer-demo.mp4?raw=1)** · [English captions](docs/demo/hodometer-demo.srt)
+
+Actual Hodometer footage follows a controlled upload through process inspection, packet capture, and a verified
+firewall block. The Sentinel segment is a clearly labeled simulated AI investigation, with scores and dry-run
+behavior computed by the repository code. Personal details and unrelated processes are removed from the published video.
+
 ## What it does
 
 - **Exact per-process traffic.** Reads the kernel network ETW provider in real time (the same source Resource Monitor
