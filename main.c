@@ -1,7 +1,10 @@
-/*  Hodometer 1.2  -  system-tray network monitor for Windows 10/11 (x64). Single C file, Win32 only, no runtime.
+/*  Hodometer 1.3  -  system-tray network monitor for Windows 10/11 (x64). Single C file, Win32 only, no runtime.
  *  1.2 adds the Inspector ("zoom"): per-process connections with lifecycle, retransmits and TCP ESTATS RTT, a process profile
  *  (CPU, memory, disk, GPU, signer), a second ETW session that reads raw frames from Windows' own ndiscap.sys and decodes
  *  TLS SNI / DNS / HTTP / QUIC per connection, pcapng export, and a process timeline (spawns, image loads, flows).
+ *  1.3 scales the socket for many agents at once: commands run on worker threads (ordered per client), up to four pcapng
+ *  captures at a time, a cursor / active / since filter on conns, a per-client handshake-only packet filter, a flowinfo
+ *  event when a flow's SNI / ALPN / HTTP / QUIC identity is first decoded, 64 watch slots and a signer cache.
  */
 #define _WIN32_WINNT 0x0A00
 #define WINVER 0x0A00
@@ -40,7 +43,7 @@
 #include <ctype.h>
 #include <wchar.h>
 
-#define APP_VERSION      "1.2.0"
+#define APP_VERSION      "1.3.0"
 #define APP_CLASS        L"HodometerMain"
 #define INSPECT_CLASS    L"HodometerInspect"
 #define ZOOM_SESSION     L"HodometerZoom"
@@ -50,8 +53,15 @@
 #define PKT_RING         2048
 #define TRACE_RING       4096
 #define MAX_INSPECT      8
-#define MAX_ZOOM_PIDS    64
-#define MAX_WATCH        8
+#define MAX_ZOOM_PIDS    256
+#define MAX_WATCH        64
+#define MAX_CAPS         4
+#define CMD_WORKERS      4
+#define JOB_RING         128
+#define CMD_BIG          (640 * 1024)
+#define CONNS_PAGE       800
+#define PKT_BUDGET       200
+#define SIG_CACHE        64
 #define REASM_SLOTS      32
 #define REASM_MAX        4096
 #define ISPARK_N         120
@@ -163,7 +173,7 @@ typedef struct {
     uint64_t tx, rx, tx_win, rx_win, retx, pkts_out, pkts_in; double tx_rate, rx_rate;
     DWORD retx_events, reconnects; uint16_t mss; int connect_ms;
     int estats; ULONG srtt, minrtt, maxrtt, rto, pretrans, timeouts, cong, cur_mss, dupacks;
-    char sni[96], alpn[24], http[96]; uint16_t tls_ver; BYTE tls_hello, quic; uint32_t quic_ver;
+    char sni[96], alpn[24], http[96]; uint16_t tls_ver; BYTE tls_hello, quic, announced; uint32_t quic_ver;   /* announced: a flowinfo event went out for this flow */
     int hnext;
 } Conn;
 typedef struct { ULONGLONG t; DWORD pid; int conn; BYTE out, v6, udp, flags; uint16_t len, lport, rport; BYTE raddr[16]; char info[112]; } Pkt;
@@ -176,7 +186,12 @@ typedef struct { wchar_t path[MAX_PATH]; int count; ULONGLONG last; int blocked;
 typedef struct { wchar_t path[MAX_PATH]; char since[24]; } Blocked;
 typedef struct { char t[20]; uint64_t tx, rx; int n; struct { DWORD pid; wchar_t name[48]; uint64_t tx, rx; } p[HIST_PROCS]; } Minute;
 #define OUTBUF_MAX (512 * 1024)
-typedef struct { SOCKET s; int state; /* 0 free 1 pending 2 allowed 3 deny-close */ int greeted; DWORD pid, ppid; wchar_t path[MAX_PATH]; wchar_t name[64]; char sha[65]; char buf[CLIENT_LINE_MAX]; int len; ULONGLONG since; int once; char *outbuf; int outlen; int overflow; DWORD watch[MAX_WATCH]; int nwatch, watch_pkts; LONG pkt_budget; } Client;
+/* watch_pkts: 0 flow/trace/flowinfo only, 1 every frame (pkt), 2 decoded handshakes only (TLS hellos, QUIC hellos, DNS, HTTP). gen tells a queued command from a client that has since been replaced in the slot */
+typedef struct { SOCKET s; int state; /* 0 free 1 pending 2 allowed 3 deny-close */ int greeted; DWORD pid, ppid, gen; wchar_t path[MAX_PATH]; wchar_t name[64]; char sha[65]; char buf[CLIENT_LINE_MAX]; int len; ULONGLONG since; int once; char *outbuf; int outlen; int overflow; DWORD watch[MAX_WATCH]; int nwatch, watch_pkts; LONG pkt_budget; } Client;
+typedef struct { int used; int ci; DWORD gen; ULONGLONG seq; char line[CLIENT_LINE_MAX]; } Job;   /* one queued socket command */
+typedef struct { FILE *f; DWORD pid; ULONGLONG started, until; uint64_t pkts, bytes; wchar_t path[MAX_PATH]; } Cap;   /* one running pcapng capture (pid 0 = every process the zoom is interested in) */
+typedef struct { wchar_t path[MAX_PATH]; DWORD pid; uint64_t pkts, bytes; } CapDone;
+typedef struct { wchar_t path[MAX_PATH]; char sha[65]; int sig; wchar_t name[160]; ULONGLONG when; } SigEnt;
 
 static Proc g_procs[MAX_PROCS]; static int g_pidx[PID_HASH];   /* pid -> index+1 (open addressing) */
 static Conn g_conns[MAX_CONNS]; static int g_chash[CONN_HASH];
@@ -187,7 +202,9 @@ static DWORD g_zoom_pids[MAX_ZOOM_PIDS]; static int g_nzoom, g_zoom_all;
 static volatile LONG g_zoom_state;                                         /* 0 off, 1 starting, 2 running, -1 error */
 static ULONG g_zoom_err; static TRACEHANDLE g_zoom_session; static ULONGLONG g_zoom_idle_since, g_zoom_fail_tick;
 static volatile LONGLONG g_zoom_frames, g_zoom_matched, g_zoom_unmatched, g_zoom_bytes;
-static FILE *g_cap_f; static DWORD g_cap_pid; static ULONGLONG g_cap_until; static uint64_t g_cap_pkts, g_cap_bytes; static wchar_t g_cap_path[MAX_PATH];
+static Cap g_caps[MAX_CAPS]; static CapDone g_cap_last;                    /* under g_zlock; g_cap_last = the capture closed most recently (Inspector header) */
+static Job g_jobs[JOB_RING]; static ULONGLONG g_job_seq; static volatile BYTE g_cmd_busy[MAX_CLIENTS]; static CRITICAL_SECTION g_jlock; static CONDITION_VARIABLE g_jcv; static DWORD g_client_gen;   /* g_cmd_busy: written under g_jlock; the socket thread reads it to keep a slot out of reuse while a command of its old client still runs */
+static SigEnt g_sigc[SIG_CACHE]; static int g_sigc_n; static CRITICAL_SECTION g_slock;
 static BCRYPT_ALG_HANDLE g_alg_hmac, g_alg_ecb, g_alg_gcm;
 static Proc g_snap[MAX_PROCS]; static int g_snap_n;
 static CRITICAL_SECTION g_lock, g_clock, g_hlock, g_tlock;
@@ -373,6 +390,7 @@ static void send_line(int i, const char *s);
 static void bcast(const char *s);
 static void zoom_recalc(void);
 static int build_inspect_json(DWORD pid, char *out, int n, int live_ok);
+static void append_conn_json(char **cur, char *end, const Conn *c);
 static HWND insp_hwnd(DWORD pid);
 static volatile LONG g_watch_dirty;
 static void addr_str(int v6, const BYTE *a, char *out, int n) { if (!inet_ntop(v6 ? AF_INET6 : AF_INET, (void *)a, out, n)) { strncpy(out, "?", n); out[n - 1] = 0; } }
@@ -418,10 +436,10 @@ static int trace_find_start(DWORD pid, wchar_t *out, int n) {   /* newest start 
     LeaveCriticalSection(&g_zlock); return ok;
 }
 static int zoom_interested(DWORD pid) { if (g_zoom_all) return 1; int r = 0; EnterCriticalSection(&g_zlock); for (int i = 0; i < g_nzoom; i++) if (g_zoom_pids[i] == pid) { r = 1; break; } LeaveCriticalSection(&g_zlock); return r; }
-static void send_watchers(DWORD pid, const char *s, int is_pkt) {
+static void send_watchers(DWORD pid, const char *s, int is_pkt) {   /* is_pkt 0 flow/trace/flowinfo, 1 a frame, 2 a frame whose decode is a handshake (TLS/QUIC hello, DNS, HTTP) */
     for (int i = 0; i < MAX_CLIENTS; i++) {
         int on = 0; EnterCriticalSection(&g_clock); Client *c = &g_clients[i];
-        if (c->s != INVALID_SOCKET && c->state == 2) for (int k = 0; k < c->nwatch; k++) if (c->watch[k] == pid || c->watch[k] == 0xFFFFFFFFu) { on = !is_pkt || (c->watch_pkts && c->pkt_budget-- > 0); break; }
+        if (c->s != INVALID_SOCKET && c->state == 2) for (int k = 0; k < c->nwatch; k++) if (c->watch[k] == pid || c->watch[k] == 0xFFFFFFFFu) { on = !is_pkt || ((c->watch_pkts == 1 || (c->watch_pkts == 2 && is_pkt == 2)) && c->pkt_budget-- > 0); break; }
         LeaveCriticalSection(&g_clock); if (on) send_line(i, s);
     }
 }
@@ -480,7 +498,7 @@ static void conns_seed(DWORD pid) {   /* current TCP table rows of pid -> connec
         if (t && GetExtendedTcpTable(t, &sz, FALSE, AF_INET6, TCP_TABLE_OWNER_PID_ALL, 0) == NO_ERROR) { EnterCriticalSection(&g_lock); for (DWORD i = 0; i < t->dwNumEntries; i++) { const MIB_TCP6ROW_OWNER_PID *r = &t->table[i]; if (r->dwOwningPid != pid) continue; int st = mib_state_map(r->dwState); if (st < 0) continue; Conn *c = conn_get(pid, 1, 0, r->ucLocalAddr, ntohs((uint16_t)r->dwLocalPort), r->ucRemoteAddr, ntohs((uint16_t)r->dwRemotePort)); if (c) { c->stamp = stamp; if (c->state != 4) c->state = (BYTE)st; } } LeaveCriticalSection(&g_lock); }
         free(t);
     }
-    EnterCriticalSection(&g_lock); ULONGLONG now = GetTickCount64(); for (int i = 0; i < MAX_CONNS; i++) { Conn *c = &g_conns[i]; if (c->used && c->pid == pid && !c->udp && c->state == 2 && c->stamp != stamp) { c->state = 3; c->t_close = now; } } LeaveCriticalSection(&g_lock);
+    EnterCriticalSection(&g_lock); ULONGLONG now = GetTickCount64(); for (int i = 0; i < MAX_CONNS; i++) { Conn *c = &g_conns[i]; if (c->used && c->pid == pid && !c->udp && c->state == 2 && c->stamp != stamp) { c->state = 3; c->t_close = now; c->last_seen = now; } } LeaveCriticalSection(&g_lock);
 }
 static void estats_refresh(DWORD pid) {   /* enable + read TCP ESTATS path statistics for the established TCP connections of pid (elevated: any process) */
     Conn *snap = (Conn *)malloc(256 * sizeof(Conn)); if (!snap) return; int n = 0;
@@ -604,8 +622,16 @@ static int exe_signer(const wchar_t *path, wchar_t *out, int n) {   /* 1 signed 
     }
     return st == ERROR_SUCCESS ? 1 : 3;
 }
+static int exe_signer_cached(const wchar_t *path, wchar_t *out, int n, char sha[65]) {   /* exe_signer keyed by path + SHA-256 of the file (a changed file is checked again); sha may be NULL */
+    char h[65]; out[0] = 0; if (!sha256_file(path, h)) return exe_signer(path, out, n); if (sha) strcpy(sha, h);
+    EnterCriticalSection(&g_slock); for (int i = 0; i < g_sigc_n; i++) { SigEnt *e = &g_sigc[i]; if (!_wcsicmp(e->path, path) && !strcmp(e->sha, h)) { wcsncpy(out, e->name, n - 1); out[n - 1] = 0; int sig = e->sig; e->when = GetTickCount64(); LeaveCriticalSection(&g_slock); return sig; } } LeaveCriticalSection(&g_slock);
+    int sig = exe_signer(path, out, n);
+    EnterCriticalSection(&g_slock); int slot = g_sigc_n < SIG_CACHE ? g_sigc_n++ : 0; if (slot == 0 && g_sigc_n == SIG_CACHE) for (int i = 1; i < SIG_CACHE; i++) if (g_sigc[i].when < g_sigc[slot].when) slot = i;
+    SigEnt *e = &g_sigc[slot]; wcsncpy(e->path, path, MAX_PATH - 1); e->path[MAX_PATH - 1] = 0; strcpy(e->sha, h); e->sig = sig; wcsncpy(e->name, out, 159); e->name[159] = 0; e->when = GetTickCount64(); LeaveCriticalSection(&g_slock);
+    return sig;
+}
 typedef struct { HWND h; wchar_t path[MAX_PATH]; } SignerJob;
-static DWORD WINAPI signer_thread(LPVOID a) { SignerJob *j = (SignerJob *)a; wchar_t *res = (wchar_t *)calloc(170, sizeof(wchar_t)); res[0] = (wchar_t)exe_signer(j->path, res + 1, 160); if (!IsWindow(j->h) || !PostMessageW(j->h, WM_SIGNER, 0, (LPARAM)res)) free(res); free(j); return 0; }
+static DWORD WINAPI signer_thread(LPVOID a) { SignerJob *j = (SignerJob *)a; wchar_t *res = (wchar_t *)calloc(170, sizeof(wchar_t)); res[0] = (wchar_t)exe_signer_cached(j->path, res + 1, 160, NULL); if (!IsWindow(j->h) || !PostMessageW(j->h, WM_SIGNER, 0, (LPARAM)res)) free(res); free(j); return 0; }
 static void signer_async(HWND h, const wchar_t *path) { SignerJob *j = (SignerJob *)calloc(1, sizeof *j); j->h = h; wcsncpy(j->path, path, MAX_PATH - 1); HANDLE t = CreateThread(NULL, 0, signer_thread, j, 0, NULL); if (t) CloseHandle(t); else free(j); }
 
 static int kill_pid(DWORD pid, char *err, int n) {
@@ -848,19 +874,35 @@ static void pcap_packet(FILE *f, ULONGLONG ft, const BYTE *data, int n, int raw_
     if (raw_ip) { BYTE eth[14] = { 0 }; eth[12] = v6 ? 0x86 : 0x08; eth[13] = v6 ? 0xDD : 0x00; fwrite(eth, 1, 14, f); }
     fwrite(data, 1, n, f); static const BYTE z[4]; fwrite(z, 1, pad, f); fwrite(&len, 4, 1, f);
 }
-static int cap_close_locked(char *js, int n) {   /* under g_zlock; returns 1 and the 'capture' event to broadcast after unlocking */
-    if (!g_cap_f) return 0; fclose(g_cap_f); g_cap_f = NULL; char p[1200]; jw(g_cap_path, p, sizeof p);
-    snprintf(js, n, "{\"ev\":\"capture\",\"ok\":true,\"path\":\"%s\",\"pid\":%lu,\"packets\":%llu,\"bytes\":%llu}", p, (unsigned long)g_cap_pid, (unsigned long long)g_cap_pkts, (unsigned long long)g_cap_bytes); return 1;
+/* Up to MAX_CAPS captures run at once, one per pid (pid 0 = every process the zoom is interested in); starting one for a pid that is already
+   being captured replaces that capture. The file is closed under g_zlock; the 'capture' event goes out after unlocking (cap_announce). */
+static int cap_close_locked(int k, CapDone *d) {   /* under g_zlock; returns 1 and fills d */
+    Cap *c = &g_caps[k]; if (!c->f) return 0; fclose(c->f); c->f = NULL; wcscpy(d->path, c->path); d->pid = c->pid; d->pkts = c->pkts; d->bytes = c->bytes; g_cap_last = *d; return 1;
 }
-static void cap_announce(const char *js) { bcast(js); log_json(js); wchar_t det[120]; _snwprintf(det, 120, L"pcapng saved: %ls  (%I64u packets)", basename_w(g_cap_path), (unsigned long long)g_cap_pkts); trace_add(g_cap_pid, 0, 14, det); zoom_recalc(); }
-static int cap_start(DWORD pid, int seconds, const wchar_t *path, char *err, int n) {   /* pid 0 = every process the zoom is interested in */
-    if (seconds <= 0) seconds = 30; if (seconds > 3600) seconds = 3600; char old[1500]; int had;
-    EnterCriticalSection(&g_zlock); had = cap_close_locked(old, sizeof old);
-    FILE *f = _wfopen(path, L"wb"); if (!f) { LeaveCriticalSection(&g_zlock); if (had) cap_announce(old); snprintf(err, n, "cannot create %ls", path); return 0; }
-    pcap_header(f); g_cap_f = f; g_cap_pid = pid; g_cap_until = now_ft() + (ULONGLONG)seconds * 10000000ULL; g_cap_pkts = g_cap_bytes = 0; wcsncpy(g_cap_path, path, MAX_PATH - 1);
-    LeaveCriticalSection(&g_zlock); if (had) cap_announce(old); zoom_recalc(); return 1;
+static int cap_active_locked(void) { int n = 0; for (int k = 0; k < MAX_CAPS; k++) if (g_caps[k].f) n++; return n; }
+static int cap_for_pid_locked(DWORD pid) { for (int k = 0; k < MAX_CAPS; k++) if (g_caps[k].f && g_caps[k].pid == pid) return k; return -1; }
+static void cap_announce(const CapDone *d) {
+    int left; EnterCriticalSection(&g_zlock); left = cap_active_locked(); LeaveCriticalSection(&g_zlock);
+    char p[1200]; jw(d->path, p, sizeof p); char js[1500];
+    snprintf(js, sizeof js, "{\"ev\":\"capture\",\"ok\":true,\"path\":\"%s\",\"pid\":%lu,\"packets\":%llu,\"bytes\":%llu,\"active\":%d}", p, (unsigned long)d->pid, (unsigned long long)d->pkts, (unsigned long long)d->bytes, left);
+    bcast(js); log_json(js); wchar_t det[120]; _snwprintf(det, 120, L"pcapng saved: %ls  (%I64u packets)", basename_w(d->path), (unsigned long long)d->pkts); trace_add(d->pid, 0, 14, det); zoom_recalc();
 }
-static void cap_stop(void) { char js[1500]; int had; EnterCriticalSection(&g_zlock); had = cap_close_locked(js, sizeof js); LeaveCriticalSection(&g_zlock); if (had) cap_announce(js); }
+static int cap_start(DWORD pid, int seconds, const wchar_t *path, char *err, int n) {
+    if (seconds <= 0) seconds = 30; if (seconds > 3600) seconds = 3600; CapDone old; int had = 0;
+    EnterCriticalSection(&g_zlock); int slot = cap_for_pid_locked(pid); if (slot >= 0) had = cap_close_locked(slot, &old); else for (int k = 0; k < MAX_CAPS; k++) if (!g_caps[k].f) { slot = k; break; }
+    if (slot < 0) { LeaveCriticalSection(&g_zlock); snprintf(err, n, "%d captures already running (capture stop <pid> ends one)", MAX_CAPS); return 0; }
+    FILE *f = _wfopen(path, L"wb"); if (!f) { LeaveCriticalSection(&g_zlock); if (had) cap_announce(&old); snprintf(err, n, "cannot create %ls", path); return 0; }
+    Cap *c = &g_caps[slot]; pcap_header(f); c->f = f; c->pid = pid; c->started = now_ft(); c->until = c->started + (ULONGLONG)seconds * 10000000ULL; c->pkts = c->bytes = 0; wcsncpy(c->path, path, MAX_PATH - 1); c->path[MAX_PATH - 1] = 0;
+    LeaveCriticalSection(&g_zlock); if (had) cap_announce(&old); zoom_recalc(); return 1;
+}
+static int cap_stop(DWORD pid, int all) {   /* ends the capture of pid, or every capture; returns how many ended */
+    CapDone done[MAX_CAPS]; int nd = 0; EnterCriticalSection(&g_zlock); for (int k = 0; k < MAX_CAPS; k++) if (g_caps[k].f && (all || g_caps[k].pid == pid)) nd += cap_close_locked(k, &done[nd]); LeaveCriticalSection(&g_zlock);
+    for (int k = 0; k < nd; k++) cap_announce(&done[k]); return nd;
+}
+static void cap_expire(void) {   /* once a second: close captures whose time is up even when no frame of theirs arrives */
+    CapDone done[MAX_CAPS]; int nd = 0; ULONGLONG now = now_ft(); EnterCriticalSection(&g_zlock); for (int k = 0; k < MAX_CAPS; k++) if (g_caps[k].f && now > g_caps[k].until) nd += cap_close_locked(k, &done[nd]); LeaveCriticalSection(&g_zlock);
+    for (int k = 0; k < nd; k++) cap_announce(&done[k]);
+}
 static void pkt_handle(const BYTE *f, int n, int raw_ip, DWORD ifidx, ULONGLONG ts) {
     PktInfo pi; if (!parse_frame(f, n, raw_ip, &pi)) return;
     int out = 1; EnterCriticalSection(&g_lock);
@@ -871,24 +913,31 @@ static void pkt_handle(const BYTE *f, int n, int raw_ip, DWORD ifidx, ULONGLONG 
     int ci = (int)(c - g_conns), had_hello = c->tls_hello, quic = c->quic; DWORD pid = c->pid; BYTE raddr[16]; memcpy(raddr, c->raddr, 16); uint16_t lport = c->lport, rport = c->rport;
     LeaveCriticalSection(&g_lock); InterlockedIncrement64(&g_zoom_matched);
     Decoded d; memset(&d, 0, sizeof d); if (pi.udp) decode_udp(ci, quic, &pi, out, &d); else decode_tcp(ci, had_hello, &pi, out, &d);
+    int interested = zoom_interested(pid), announce = 0; Conn fi;
     if (d.sni[0] || d.alpn[0] || d.tls_ver || d.http[0] || d.quic_ver) {
         EnterCriticalSection(&g_lock); Conn *c2 = &g_conns[ci];
-        if (c2->used && c2->lport == lport && c2->rport == rport) { if (d.sni[0]) { strcpy(c2->sni, d.sni); c2->tls_hello = 1; } if (d.alpn[0]) strcpy(c2->alpn, d.alpn); if (d.tls_ver && (!c2->tls_ver || d.tls_server)) c2->tls_ver = d.tls_ver; if (d.http[0] && !c2->http[0]) strcpy(c2->http, d.http); if (d.quic_ver) { c2->quic = 1; c2->quic_ver = d.quic_ver; } }
+        if (c2->used && c2->lport == lport && c2->rport == rport) { if (d.sni[0]) { strcpy(c2->sni, d.sni); c2->tls_hello = 1; } if (d.alpn[0]) strcpy(c2->alpn, d.alpn); if (d.tls_ver && (!c2->tls_ver || d.tls_server)) c2->tls_ver = d.tls_ver; if (d.http[0] && !c2->http[0]) strcpy(c2->http, d.http); if (d.quic_ver) { c2->quic = 1; c2->quic_ver = d.quic_ver; }
+            /* flowinfo: once per flow when its identity is first decoded (1 TLS/QUIC ClientHello with SNI or ALPN, 2 HTTP request, 4 TLS ServerHello of a flow whose ClientHello was never seen) */
+            int cls = 0; if (d.sni[0] || d.alpn[0]) cls |= 1; if (d.http[0]) cls |= 2; if (d.tls_server && !(c2->announced & 1)) cls |= 4;
+            if (interested && (cls & ~c2->announced)) { c2->announced |= (BYTE)cls; fi = *c2; announce = 1; } }
         LeaveCriticalSection(&g_lock);
     }
     for (int i = 0; i < d.nlearn; i++) host_learn(d.learn[i].ip, d.learn[i].name, 1);
     char ra[48]; addr_str(pi.v6, raddr, ra, sizeof ra);
     if (d.sni[0]) { wchar_t w[128]; to_wide(d.sni, w, 128); host_learn(ra, w, 4); }
-    if (!zoom_interested(pid)) return;
+    if (!interested) return;
+    char js[1500];
+    if (announce) { char cj[1400], *cp = cj, *ce = cj + sizeof cj - 2; cj[0] = 0; append_conn_json(&cp, ce, &fi); if (cj[0] == '{') { snprintf(js, sizeof js, "{\"ev\":\"flowinfo\",%s", cj + 1); send_watchers(pid, js, 0); } }
     Pkt pk; memset(&pk, 0, sizeof pk); pk.t = ts; pk.pid = pid; pk.conn = ci; pk.out = (BYTE)out; pk.v6 = (BYTE)pi.v6; pk.udp = (BYTE)pi.udp; pk.flags = pi.tcpflags; pk.len = (uint16_t)(n > 65535 ? 65535 : n); pk.lport = lport; pk.rport = rport; memcpy(pk.raddr, raddr, 16); strncpy(pk.info, d.info, sizeof pk.info - 1);
-    char js[1500]; int capjs = 0;
+    CapDone done[MAX_CAPS]; int nd = 0;
     EnterCriticalSection(&g_zlock); g_pkts[g_pkt_head % PKT_RING] = pk; g_pkt_head++;
-    if (g_cap_f && (g_cap_pid == 0 || g_cap_pid == pid)) { if (ts > g_cap_until) capjs = cap_close_locked(js, sizeof js); else { pcap_packet(g_cap_f, ts, f, n, raw_ip, pi.v6); g_cap_pkts++; g_cap_bytes += (uint64_t)n; } }
+    for (int k = 0; k < MAX_CAPS; k++) { Cap *cp = &g_caps[k]; if (!cp->f || (cp->pid && cp->pid != pid)) continue; if (ts > cp->until) nd += cap_close_locked(k, &done[nd]); else { pcap_packet(cp->f, ts, f, n, raw_ip, pi.v6); cp->pkts++; cp->bytes += (uint64_t)n; } }
     LeaveCriticalSection(&g_zlock);
-    if (capjs) cap_announce(js);
+    for (int k = 0; k < nd; k++) cap_announce(&done[k]);
     wchar_t host[128]; char hostu[300] = "", info[400], ts_s[40]; if (host_lookup(ra, host, 128)) jw(host, hostu, sizeof hostu); json_escape(d.info, info, sizeof info); ft_iso(ts, ts_s, sizeof ts_s); char fl[48]; tcp_flags_str(pi.tcpflags, fl, sizeof fl);
     snprintf(js, sizeof js, "{\"ev\":\"pkt\",\"pid\":%lu,\"t\":\"%s\",\"dir\":\"%s\",\"proto\":\"%s%s\",\"lport\":%u,\"remote\":\"%s\",\"port\":%u,\"host\":\"%s\",\"len\":%d,\"flags\":\"%s\",\"info\":\"%s\"}", (unsigned long)pid, ts_s, out ? "out" : "in", pi.udp ? "udp" : "tcp", pi.v6 ? "6" : "", lport, ra, rport, hostu, n, fl, info);
-    send_watchers(pid, js, 1);
+    int handshake = d.kind == 10 || d.kind == 11 || d.kind == 12 || (d.kind == 13 && (d.sni[0] || d.alpn[0]));   /* what a 'handshakes' watcher receives: TLS hellos, DNS, HTTP, decoded QUIC hellos */
+    send_watchers(pid, js, handshake ? 2 : 1);
     if ((d.kind == 10 && d.sni[0]) || (d.kind == 13 && d.sni[0]) || (d.kind == 11 && !strncmp(d.info, "DNS query", 9)) || (d.kind == 12 && out)) { wchar_t det[120]; to_wide(d.info, det, 120); trace_add(pid, 0, d.kind, det); }
 }
 static void CALLBACK on_zoom_event(PEVENT_RECORD r) {
@@ -922,7 +971,7 @@ static void zoom_recalc(void) {   /* interest set = open inspectors + socket wat
     DWORD pids[MAX_ZOOM_PIDS]; int n = 0, all = 0;
     for (int i = 0; i < MAX_INSPECT; i++) if (g_insp_pids[i] && n < MAX_ZOOM_PIDS) pids[n++] = g_insp_pids[i];
     EnterCriticalSection(&g_clock); for (int i = 0; i < MAX_CLIENTS; i++) if (g_clients[i].s != INVALID_SOCKET && g_clients[i].state == 2) for (int k = 0; k < g_clients[i].nwatch; k++) { if (g_clients[i].watch[k] == 0xFFFFFFFFu) all = 1; else if (n < MAX_ZOOM_PIDS) pids[n++] = g_clients[i].watch[k]; } LeaveCriticalSection(&g_clock);
-    EnterCriticalSection(&g_zlock); if (g_cap_f) { if (g_cap_pid == 0) all = 1; else if (n < MAX_ZOOM_PIDS) pids[n++] = g_cap_pid; } memcpy(g_zoom_pids, pids, n * sizeof pids[0]); g_nzoom = n; g_zoom_all = all; LeaveCriticalSection(&g_zlock);
+    EnterCriticalSection(&g_zlock); for (int k = 0; k < MAX_CAPS; k++) if (g_caps[k].f) { if (g_caps[k].pid == 0) all = 1; else if (n < MAX_ZOOM_PIDS) pids[n++] = g_caps[k].pid; } memcpy(g_zoom_pids, pids, n * sizeof pids[0]); g_nzoom = n; g_zoom_all = all; LeaveCriticalSection(&g_zlock);
     if (n || all) { g_zoom_idle_since = 0; zoom_start(); } else if (!g_zoom_idle_since) g_zoom_idle_since = GetTickCount64();
 }
 static const char *zoom_state_str(void) { switch (g_zoom_state) { case 2: return "running"; case 1: return "starting"; case -1: return "error"; default: return "off"; } }
@@ -1017,16 +1066,16 @@ static void append_conn_json(char **cur, char *end, const Conn *c) {
     if (n > 0 && *cur + n < end) *cur += n; else **cur = 0;
 }
 static void build_status(char *out, int n) {
-    snprintf(out, n, "{\"reply\":\"status\",\"version\":\"%s\",\"tx_mbps\":%.3f,\"rx_mbps\":%.3f,\"tx_total\":%llu,\"rx_total\":%llu,\"audit\":\"%s\",\"audit_auto\":%s,\"etw\":\"%s\",\"etw_error\":%lu,\"include_local\":%s,\"paused\":%s,\"threshold_tx_mbps\":%.2f,\"threshold_rx_mbps\":%.2f,\"clients\":%d,\"trusted\":%d,\"blocked\":%d,\"conn_events\":%llu,\"history_minutes\":%d,\"uptime_s\":%llu,\"port\":%d}",
-        APP_VERSION, g_tx_rate / 1048576.0, g_rx_rate / 1048576.0, (unsigned long long)g_tx_total, (unsigned long long)g_rx_total, audit_str(), g_audit_auto ? "true" : "false", etw_str(), (unsigned long)g_etw_err, g_include_local ? "true" : "false", g_paused ? "true" : "false", g_tx_thresh, g_rx_thresh, client_count(), g_ntrust, g_nblocked, (unsigned long long)g_conn_events, g_hist_n, (unsigned long long)((GetTickCount64() - g_start_tick) / 1000), g_port);
+    int caps; EnterCriticalSection(&g_zlock); caps = cap_active_locked(); LeaveCriticalSection(&g_zlock);
+    snprintf(out, n, "{\"reply\":\"status\",\"version\":\"%s\",\"tx_mbps\":%.3f,\"rx_mbps\":%.3f,\"tx_total\":%llu,\"rx_total\":%llu,\"audit\":\"%s\",\"audit_auto\":%s,\"etw\":\"%s\",\"etw_error\":%lu,\"zoom\":\"%s\",\"include_local\":%s,\"paused\":%s,\"threshold_tx_mbps\":%.2f,\"threshold_rx_mbps\":%.2f,\"clients\":%d,\"trusted\":%d,\"blocked\":%d,\"captures\":%d,\"max_captures\":%d,\"max_watch\":%d,\"workers\":%d,\"conn_events\":%llu,\"history_minutes\":%d,\"uptime_s\":%llu,\"port\":%d}",
+        APP_VERSION, g_tx_rate / 1048576.0, g_rx_rate / 1048576.0, (unsigned long long)g_tx_total, (unsigned long long)g_rx_total, audit_str(), g_audit_auto ? "true" : "false", etw_str(), (unsigned long)g_etw_err, zoom_state_str(), g_include_local ? "true" : "false", g_paused ? "true" : "false", g_tx_thresh, g_rx_thresh, client_count(), g_ntrust, g_nblocked, caps, MAX_CAPS, MAX_WATCH, CMD_WORKERS, (unsigned long long)g_conn_events, g_hist_n, (unsigned long long)((GetTickCount64() - g_start_tick) / 1000), g_port);
 }
 static int resolve_target(const char *arg, wchar_t *path, int n) {   /* pid or path -> path */
     path[0] = 0; if (!arg[0]) return 0;
     if (isdigit((unsigned char)arg[0]) && strspn(arg, "0123456789") == strlen(arg)) { DWORD pid = (DWORD)strtoul(arg, NULL, 10); EnterCriticalSection(&g_lock); Proc *p = proc_find(pid); if (p && p->path[0]) wcsncpy(path, p->path, n - 1); LeaveCriticalSection(&g_lock); if (!path[0]) pid_path(pid, path, n); return path[0] != 0; }
     to_wide(arg, path, n); return path[0] != 0;
 }
-static void handle_command(int ci, char *line) {
-    static char big[640 * 1024];
+static void handle_command(int ci, char *line, char *big, int bign) {   /* runs on a command worker; big is that worker's reply buffer (CMD_BIG) */
     char cmd[32] = "", arg1[1200] = "", arg2[1200] = "";
     while (*line == ' ' || *line == '\t') line++; size_t L = strlen(line); while (L && (line[L - 1] == '\r' || line[L - 1] == ' ')) line[--L] = 0; if (!L) return;
     if (line[0] == '{') { json_get_str(line, "cmd", cmd, sizeof cmd); if (!json_get_str(line, "pid", arg1, sizeof arg1)) if (!json_get_str(line, "path", arg1, sizeof arg1)) json_get_str(line, "value", arg1, sizeof arg1); json_get_str(line, "rx", arg2, sizeof arg2); if (!arg2[0]) json_get_str(line, "arg", arg2, sizeof arg2); }
@@ -1035,19 +1084,19 @@ static void handle_command(int ci, char *line) {
     char out[4096];
     if (!strcmp(cmd, "status")) { build_status(out, sizeof out); send_line(ci, out); }
     else if (!strcmp(cmd, "whoami")) { char p[1200], nm[200]; jw(g_clients[ci].path, p, sizeof p); jw(g_clients[ci].name, nm, sizeof nm); snprintf(out, sizeof out, "{\"reply\":\"whoami\",\"pid\":%lu,\"name\":\"%s\",\"path\":\"%s\",\"sha256\":\"%s\",\"trusted\":%s}", (unsigned long)g_clients[ci].pid, nm, p, g_clients[ci].sha, g_clients[ci].once ? "false" : "true"); send_line(ci, out); }
-    else if (!strcmp(cmd, "clients")) { char *cur = big, *end = big + sizeof big - 2; cur += snprintf(cur, end - cur, "{\"reply\":\"clients\",\"clients\":["); int first = 1; for (int i = 0; i < MAX_CLIENTS; i++) if (g_clients[i].s != INVALID_SOCKET) { char nm[200]; jw(g_clients[i].name, nm, sizeof nm); cur += snprintf(cur, end - cur, "%s{\"pid\":%lu,\"name\":\"%s\",\"state\":\"%s\",\"since_s\":%llu}", first ? "" : ",", (unsigned long)g_clients[i].pid, nm, g_clients[i].state == 2 ? "allowed" : g_clients[i].state == 1 ? "pending" : "closing", (unsigned long long)((GetTickCount64() - g_clients[i].since) / 1000)); first = 0; } cur += snprintf(cur, end - cur, "]}"); send_line(ci, big); }
+    else if (!strcmp(cmd, "clients")) { char *cur = big, *end = big + bign - 2; cur += snprintf(cur, end - cur, "{\"reply\":\"clients\",\"clients\":["); int first = 1; for (int i = 0; i < MAX_CLIENTS; i++) if (g_clients[i].s != INVALID_SOCKET) { char nm[200]; jw(g_clients[i].name, nm, sizeof nm); cur += snprintf(cur, end - cur, "%s{\"pid\":%lu,\"name\":\"%s\",\"state\":\"%s\",\"since_s\":%llu}", first ? "" : ",", (unsigned long)g_clients[i].pid, nm, g_clients[i].state == 2 ? "allowed" : g_clients[i].state == 1 ? "pending" : "closing", (unsigned long long)((GetTickCount64() - g_clients[i].since) / 1000)); first = 0; } cur += snprintf(cur, end - cur, "]}"); send_line(ci, big); }
     else if (!strcmp(cmd, "list")) {
-        char *cur = big, *end = big + sizeof big - 2; cur += snprintf(cur, end - cur, "{\"reply\":\"list\",\"procs\":["); int first = 1;
+        char *cur = big, *end = big + bign - 2; cur += snprintf(cur, end - cur, "{\"reply\":\"list\",\"procs\":["); int first = 1;
         EnterCriticalSection(&g_lock); for (int i = 0; i < MAX_PROCS; i++) { const Proc *p = &g_procs[i]; if (!p->used || (p->tx_total == 0 && p->rx_total == 0)) continue; if (!first) { if (cur < end) *cur++ = ','; } first = 0; append_proc_json(&cur, end, p); if (end - cur < 3000) break; } LeaveCriticalSection(&g_lock);
         if (cur < end) { *cur++ = ']'; *cur++ = '}'; } *cur = 0; send_line(ci, big);
     }
     else if (!strcmp(cmd, "kill")) { DWORD pid = (DWORD)strtoul(arg1, NULL, 10); char err[160] = ""; int ok = pid ? kill_pid(pid, err, sizeof err) : 0; if (!pid) strcpy(err, "usage: kill <pid>"); char e[320]; json_escape(err, e, sizeof e); snprintf(out, sizeof out, "{\"reply\":\"kill\",\"pid\":%lu,\"ok\":%s,\"error\":\"%s\"}", (unsigned long)pid, ok ? "true" : "false", e); send_line(ci, out); if (ok) { char nm[200]; jw(g_clients[ci].name, nm, sizeof nm); snprintf(out, sizeof out, "{\"ev\":\"killed\",\"pid\":%lu,\"by\":\"socket:%s\"}", (unsigned long)pid, nm); bcast(out); } }
     else if (!strcmp(cmd, "block") || !strcmp(cmd, "unblock")) { wchar_t path[MAX_PATH]; char err[160] = ""; int ok = 0; if (resolve_target(arg1, path, MAX_PATH)) ok = fw_block(path, cmd[0] == 'b', err, sizeof err); else strcpy(err, "usage: block <pid|path> (path quoted if it has spaces)"); char p[1200], e[320]; jw(path, p, sizeof p); json_escape(err, e, sizeof e); snprintf(out, sizeof out, "{\"reply\":\"%s\",\"path\":\"%s\",\"ok\":%s,\"error\":\"%s\"}", cmd, p, ok ? "true" : "false", e); send_line(ci, out); if (ok) { snprintf(out, sizeof out, "{\"ev\":\"%sed\",\"path\":\"%s\"}", cmd, p); bcast(out); } }
-    else if (!strcmp(cmd, "blocks")) { char *cur = big, *end = big + sizeof big - 2; cur += snprintf(cur, end - cur, "{\"reply\":\"blocks\",\"blocked\":["); EnterCriticalSection(&g_tlock); for (int i = 0; i < g_nblocked; i++) { char p[1200]; jw(g_blocked[i].path, p, sizeof p); cur += snprintf(cur, end - cur, "%s{\"path\":\"%s\",\"since\":\"%s\"}", i ? "," : "", p, g_blocked[i].since); } LeaveCriticalSection(&g_tlock); cur += snprintf(cur, end - cur, "]}"); send_line(ci, big); }
+    else if (!strcmp(cmd, "blocks")) { char *cur = big, *end = big + bign - 2; cur += snprintf(cur, end - cur, "{\"reply\":\"blocks\",\"blocked\":["); EnterCriticalSection(&g_tlock); for (int i = 0; i < g_nblocked; i++) { char p[1200]; jw(g_blocked[i].path, p, sizeof p); cur += snprintf(cur, end - cur, "%s{\"path\":\"%s\",\"since\":\"%s\"}", i ? "," : "", p, g_blocked[i].since); } LeaveCriticalSection(&g_tlock); cur += snprintf(cur, end - cur, "]}"); send_line(ci, big); }
     else if (!strcmp(cmd, "trust")) {
         if (!strcmp(arg1, "clear")) { EnterCriticalSection(&g_tlock); g_ntrust = 0; trust_save(); LeaveCriticalSection(&g_tlock); send_line(ci, "{\"reply\":\"trust\",\"ok\":true,\"trusted\":0}"); }
         else if (!strcmp(arg1, "remove")) { int removed = 0; wchar_t w[300]; to_wide(arg2, w, 300); EnterCriticalSection(&g_tlock); for (int i = 0; i < g_ntrust; i++) { wchar_t lp[MAX_PATH], lw[300]; wcscpy(lp, g_trust[i].path); wcscpy(lw, w); _wcslwr(lp); _wcslwr(lw); if (lw[0] && wcsstr(lp, lw)) { g_trust[i] = g_trust[--g_ntrust]; i--; removed++; } } trust_save(); LeaveCriticalSection(&g_tlock); snprintf(out, sizeof out, "{\"reply\":\"trust\",\"removed\":%d,\"trusted\":%d}", removed, g_ntrust); send_line(ci, out); }
-        else { char *cur = big, *end = big + sizeof big - 2; cur += snprintf(cur, end - cur, "{\"reply\":\"trust\",\"trusted\":["); EnterCriticalSection(&g_tlock); for (int i = 0; i < g_ntrust; i++) { char p[1200]; jw(g_trust[i].path, p, sizeof p); cur += snprintf(cur, end - cur, "%s{\"path\":\"%s\",\"sha256\":\"%s\",\"since\":\"%s\"}", i ? "," : "", p, g_trust[i].sha, g_trust[i].since); } LeaveCriticalSection(&g_tlock); cur += snprintf(cur, end - cur, "]}"); send_line(ci, big); }
+        else { char *cur = big, *end = big + bign - 2; cur += snprintf(cur, end - cur, "{\"reply\":\"trust\",\"trusted\":["); EnterCriticalSection(&g_tlock); for (int i = 0; i < g_ntrust; i++) { char p[1200]; jw(g_trust[i].path, p, sizeof p); cur += snprintf(cur, end - cur, "%s{\"path\":\"%s\",\"sha256\":\"%s\",\"since\":\"%s\"}", i ? "," : "", p, g_trust[i].sha, g_trust[i].since); } LeaveCriticalSection(&g_tlock); cur += snprintf(cur, end - cur, "]}"); send_line(ci, big); }
     }
     else if (!strcmp(cmd, "snap")) {   /* snap [file.bmp] [pid]: capture the main window, or the open Inspector of pid, to a .bmp; an AI can look at the GUI */
         wchar_t *path = (wchar_t *)calloc(MAX_PATH, sizeof(wchar_t)); if (arg1[0] && !isdigit((unsigned char)arg1[0])) to_wide(arg1, path, MAX_PATH); else _snwprintf(path, MAX_PATH, L"%ls\\snapshot.bmp", g_exe_dir);
@@ -1056,7 +1105,7 @@ static void handle_command(int ci, char *line) {
         char p[1200]; jw(path, p, sizeof p); snprintf(out, sizeof out, "{\"reply\":\"snap\",\"path\":\"%s\",\"window\":\"%s\",\"scheduled\":true,\"note\":\"a 'snap' event follows when the file is written\"}", p, target ? "inspector" : "main"); send_line(ci, out);
         PostMessageW(g_main, WM_SNAP, (WPARAM)target, (LPARAM)path);
     }
-    else if (!strcmp(cmd, "denials")) { char *cur = big, *end = big + sizeof big - 2; cur += snprintf(cur, end - cur, "{\"reply\":\"denials\",\"suspended\":%s,\"denied\":[", GetTickCount64() < g_auth_suspended_until ? "true" : "false"); EnterCriticalSection(&g_tlock); for (int i = 0; i < g_ndeny; i++) { char p[1200]; jw(g_deny[i].path, p, sizeof p); cur += snprintf(cur, end - cur, "%s{\"path\":\"%s\",\"count\":%d,\"blocked\":%s,\"cooldown_s\":%lld}", i ? "," : "", p, g_deny[i].count, g_deny[i].blocked ? "true" : "false", (long long)((600000 - (GetTickCount64() - g_deny[i].last)) / 1000 > 0 ? (600000 - (GetTickCount64() - g_deny[i].last)) / 1000 : 0)); } LeaveCriticalSection(&g_tlock); cur += snprintf(cur, end - cur, "]}"); send_line(ci, big); }
+    else if (!strcmp(cmd, "denials")) { char *cur = big, *end = big + bign - 2; cur += snprintf(cur, end - cur, "{\"reply\":\"denials\",\"suspended\":%s,\"denied\":[", GetTickCount64() < g_auth_suspended_until ? "true" : "false"); EnterCriticalSection(&g_tlock); for (int i = 0; i < g_ndeny; i++) { char p[1200]; jw(g_deny[i].path, p, sizeof p); cur += snprintf(cur, end - cur, "%s{\"path\":\"%s\",\"count\":%d,\"blocked\":%s,\"cooldown_s\":%lld}", i ? "," : "", p, g_deny[i].count, g_deny[i].blocked ? "true" : "false", (long long)((600000 - (GetTickCount64() - g_deny[i].last)) / 1000 > 0 ? (600000 - (GetTickCount64() - g_deny[i].last)) / 1000 : 0)); } LeaveCriticalSection(&g_tlock); cur += snprintf(cur, end - cur, "]}"); send_line(ci, big); }
     else if (!strcmp(cmd, "pardon")) {   /* clear denial record (and firewall block) for programs whose path contains the argument */
         int n = 0; wchar_t w[300]; to_wide(arg1, w, 300); _wcslwr(w);
         EnterCriticalSection(&g_tlock); for (int i = 0; i < g_ndeny && w[0]; i++) { wchar_t lp[MAX_PATH]; wcscpy(lp, g_deny[i].path); _wcslwr(lp); if (wcsstr(lp, w)) { wchar_t path[MAX_PATH]; wcscpy(path, g_deny[i].path); int wasblocked = g_deny[i].blocked; g_deny[i] = g_deny[--g_ndeny]; i--; n++; LeaveCriticalSection(&g_tlock); if (wasblocked) { char err[160]; fw_block(path, 0, err, sizeof err); } EnterCriticalSection(&g_tlock); } } LeaveCriticalSection(&g_tlock);
@@ -1064,7 +1113,7 @@ static void handle_command(int ci, char *line) {
     }
     else if (!strcmp(cmd, "history")) {
         int mins = atoi(arg1); if (mins <= 0) mins = 60; if (mins > HIST_MIN) mins = HIST_MIN;
-        char *cur = big, *end = big + sizeof big - 2; cur += snprintf(cur, end - cur, "{\"reply\":\"history\",\"minutes\":[");
+        char *cur = big, *end = big + bign - 2; cur += snprintf(cur, end - cur, "{\"reply\":\"history\",\"minutes\":[");
         EnterCriticalSection(&g_lock); int n = g_hist_n < mins ? g_hist_n : mins; int first = 1;
         for (int k = n; k >= 1 && end - cur > 4000; k--) { const Minute *m = &g_hist[(g_hist_i - k + HIST_MIN) % HIST_MIN]; cur += snprintf(cur, end - cur, "%s{\"t\":\"%s\",\"tx\":%llu,\"rx\":%llu,\"procs\":[", first ? "" : ",", m->t, (unsigned long long)m->tx, (unsigned long long)m->rx); first = 0; for (int j = 0; j < m->n && j < 10; j++) { char nm[160]; jw(m->p[j].name, nm, sizeof nm); cur += snprintf(cur, end - cur, "%s{\"pid\":%lu,\"name\":\"%s\",\"tx\":%llu,\"rx\":%llu}", j ? "," : "", (unsigned long)m->p[j].pid, nm, (unsigned long long)m->p[j].tx, (unsigned long long)m->p[j].rx); } cur += snprintf(cur, end - cur, "]}"); }
         LeaveCriticalSection(&g_lock); cur += snprintf(cur, end - cur, "]}"); send_line(ci, big);
@@ -1073,45 +1122,90 @@ static void handle_command(int ci, char *line) {
     else if (!strcmp(cmd, "inspect")) {   /* everything the Inspector window shows: profile, connections with RTT/retransmits, timeline, recent packets */
         DWORD pid = (DWORD)strtoul(arg1, NULL, 10); if (!pid) { send_line(ci, "{\"reply\":\"error\",\"error\":\"usage: inspect <pid> [show]  (show also opens the Inspector window)\"}"); return; }
         if (!strcmp(arg2, "show") && g_main) PostMessageW(g_main, WM_INSPECT, (WPARAM)pid, 0);
-        build_inspect_json(pid, big, sizeof big, 0); send_line(ci, big);
+        build_inspect_json(pid, big, bign, 0); send_line(ci, big);
     }
-    else if (!strcmp(cmd, "conns")) {   /* connections of one pid (seeded from the TCP table, with ESTATS) or of every process */
-        DWORD pid = (DWORD)strtoul(arg1, NULL, 10); if (pid) { conns_seed(pid); estats_refresh(pid); }
-        Conn *cs = (Conn *)malloc(800 * sizeof(Conn)); int nc = 0; if (!cs) return;
-        EnterCriticalSection(&g_lock); for (int i = 0; i < MAX_CONNS && nc < 800; i++) if (g_conns[i].used && (!pid || g_conns[i].pid == pid)) cs[nc++] = g_conns[i]; LeaveCriticalSection(&g_lock);
-        char *cur = big, *end = big + sizeof big - 2; cur += snprintf(cur, end - cur, "{\"reply\":\"conns\",\"pid\":%lu,\"count\":%d,\"conns\":[", (unsigned long)pid, nc);
-        for (int i = 0; i < nc && end - cur > 2000; i++) { if (i) *cur++ = ','; append_conn_json(&cur, end, &cs[i]); } cur += snprintf(cur, end - cur, "]}"); free(cs); send_line(ci, big);
+    else if (!strcmp(cmd, "conns")) {   /* conns [pid|all] [active] [since <now>] [cursor <n>] [limit <n>]: connections of one pid (seeded from the TCP table, with ESTATS) or of every process, in pages */
+        DWORD pid = 0; int active = 0, limit = CONNS_PAGE, cursor = 0; ULONGLONG since = 0;
+        if (line[0] == '{') { char v[40]; pid = (DWORD)strtoul(arg1, NULL, 10); if (json_get_str(line, "active", v, sizeof v)) active = strcmp(v, "false") != 0 && strcmp(v, "0") != 0; if (json_get_str(line, "since", v, sizeof v)) since = strtoull(v, NULL, 10); if (json_get_str(line, "cursor", v, sizeof v)) cursor = atoi(v); if (json_get_str(line, "limit", v, sizeof v)) limit = atoi(v); }
+        else { char toks[2500]; snprintf(toks, sizeof toks, "%s %s", arg1, arg2); char *t = toks;
+            while (*t) { while (*t == ' ') t++; if (!*t) break; char *e = t; while (*e && *e != ' ') e++; if (*e) *e++ = 0;
+                if (!strcmp(t, "active")) active = 1; else if (isdigit((unsigned char)t[0])) pid = (DWORD)strtoul(t, NULL, 10);
+                else if (!strcmp(t, "since") || !strcmp(t, "cursor") || !strcmp(t, "limit")) { while (*e == ' ') e++; char *v = e; while (*e && *e != ' ') e++; if (*e) *e++ = 0; if (t[0] == 's') since = strtoull(v, NULL, 10); else if (t[0] == 'c') cursor = atoi(v); else limit = atoi(v); }
+                t = e; } }
+        if (limit <= 0 || limit > CONNS_PAGE) limit = CONNS_PAGE; if (cursor < 0 || cursor >= MAX_CONNS) cursor = 0;
+        if (pid) { conns_seed(pid); estats_refresh(pid); }
+        Conn *cs = (Conn *)malloc(CONNS_PAGE * sizeof(Conn)); int *idx = (int *)malloc(CONNS_PAGE * sizeof(int)); int nc = 0, total = 0, next = -1; if (!cs || !idx) { free(cs); free(idx); return; }
+        ULONGLONG now = GetTickCount64();
+        EnterCriticalSection(&g_lock);
+        for (int i = 0; i < MAX_CONNS; i++) { const Conn *c = &g_conns[i]; if (!c->used || (pid && c->pid != pid) || (active && (c->state == 3 || c->state == 4)) || (since && c->last_seen < since)) continue; total++; if (i < cursor) continue; if (nc < limit) { cs[nc] = *c; idx[nc++] = i; } else if (next < 0) next = i; }
+        LeaveCriticalSection(&g_lock);
+        char *cur = big, *end = big + bign - 2; cur += snprintf(cur, end - cur, "{\"reply\":\"conns\",\"pid\":%lu,\"active\":%s,\"since\":%llu,\"cursor\":%d,\"total\":%d,\"now\":%llu,\"conns\":[", (unsigned long)pid, active ? "true" : "false", (unsigned long long)since, cursor, total, (unsigned long long)now);
+        int em = 0; for (; em < nc && end - cur > 2000; em++) { if (em) *cur++ = ','; append_conn_json(&cur, end, &cs[em]); }
+        if (em < nc) next = idx[em];   /* the reply buffer filled up: resume from the first flow that did not fit */
+        if (next >= 0) cur += snprintf(cur, end - cur, "],\"count\":%d,\"next\":%d}", em, next); else cur += snprintf(cur, end - cur, "],\"count\":%d,\"next\":null}", em);
+        free(cs); free(idx); send_line(ci, big);
     }
-    else if (!strcmp(cmd, "watch")) {   /* watch <pid|all> [packets] | watch <pid|all> off | watch off | watch  -> flow/trace (and pkt) events for those processes */
-        EnterCriticalSection(&g_clock); Client *c = &g_clients[ci];
+    else if (!strcmp(cmd, "watch")) {   /* watch <pid|all> [packets|handshakes|nopackets] | watch <pid|all> off | watch packets|handshakes|nopackets | watch off | watch  -> flow/trace/flowinfo (and pkt) events for those processes */
+        int mode = -1; const char *mw = arg2[0] ? arg2 : arg1; if (!strcmp(mw, "packets")) mode = 1; else if (!strcmp(mw, "handshakes")) mode = 2; else if (!strcmp(mw, "nopackets")) mode = 0;
+        EnterCriticalSection(&g_clock); Client *c = &g_clients[ci]; int full = 0;
         if (!arg1[0] || !strcmp(arg1, "list")) { }
         else if (!strcmp(arg1, "off")) c->nwatch = 0;
+        else if (!arg2[0] && mode >= 0) c->watch_pkts = mode;   /* change the packet mode of an existing watch */
         else { DWORD pid = !strcmp(arg1, "all") ? 0xFFFFFFFFu : (DWORD)strtoul(arg1, NULL, 10);
-            if (!pid) { LeaveCriticalSection(&g_clock); send_line(ci, "{\"reply\":\"error\",\"error\":\"usage: watch <pid|all> [packets|off]\"}"); return; }
+            if (!pid) { LeaveCriticalSection(&g_clock); send_line(ci, "{\"reply\":\"error\",\"error\":\"usage: watch <pid|all> [packets|handshakes|nopackets|off]\"}"); return; }
             if (!strcmp(arg2, "off")) { for (int k = 0; k < c->nwatch; k++) if (c->watch[k] == pid) { c->watch[k] = c->watch[--c->nwatch]; k--; } }
-            else { int have = 0; for (int k = 0; k < c->nwatch; k++) if (c->watch[k] == pid) have = 1; if (!have && c->nwatch < MAX_WATCH) c->watch[c->nwatch++] = pid; if (!strcmp(arg2, "packets")) c->watch_pkts = 1; else if (!strcmp(arg2, "nopackets")) c->watch_pkts = 0; } }
+            else { int have = 0; for (int k = 0; k < c->nwatch; k++) if (c->watch[k] == pid) have = 1; if (!have) { if (c->nwatch < MAX_WATCH) c->watch[c->nwatch++] = pid; else full = 1; } if (mode >= 0) c->watch_pkts = mode; } }
         char *cur = out, *end = out + sizeof out - 2; cur += snprintf(cur, end - cur, "{\"reply\":\"watch\",\"watching\":["); for (int k = 0; k < c->nwatch; k++) cur += snprintf(cur, end - cur, "%s%s", k ? "," : "", c->watch[k] == 0xFFFFFFFFu ? "\"all\"" : ""), cur += c->watch[k] == 0xFFFFFFFFu ? 0 : snprintf(cur, end - cur, "%lu", (unsigned long)c->watch[k]);
-        int pk = c->watch_pkts; LeaveCriticalSection(&g_clock); zoom_recalc();
-        cur += snprintf(cur, end - cur, "],\"packets\":%s,\"zoom\":\"%s\",\"events\":[\"flow\",\"trace\"%s]}", pk ? "true" : "false", zoom_state_str(), pk ? ",\"pkt\"" : ""); send_line(ci, out);
+        int pk = c->watch_pkts, nw = c->nwatch; LeaveCriticalSection(&g_clock); zoom_recalc();
+        cur += snprintf(cur, end - cur, "],\"count\":%d,\"max\":%d,\"packets\":%s,\"mode\":\"%s\",\"zoom\":\"%s\",\"events\":[\"flow\",\"trace\",\"flowinfo\"%s]%s}", nw, MAX_WATCH, pk ? "true" : "false", pk == 1 ? "packets" : pk == 2 ? "handshakes" : "none", zoom_state_str(), pk ? ",\"pkt\"" : "", full ? ",\"error\":\"watch list full\"" : ""); send_line(ci, out);
     }
-    else if (!strcmp(cmd, "capture")) {   /* capture <pid|all> [seconds] [file.pcapng] | capture stop | capture  (JSON: {"cmd":"capture","pid":N,"seconds":S,"path":"..."}) */
-        if (!strcmp(arg1, "stop")) { cap_stop(); send_line(ci, "{\"reply\":\"capture\",\"stopped\":true}"); return; }
-        if (!arg1[0]) { EnterCriticalSection(&g_zlock); char p[1200]; jw(g_cap_path, p, sizeof p); snprintf(out, sizeof out, "{\"reply\":\"capture\",\"active\":%s,\"pid\":%lu,\"path\":\"%s\",\"packets\":%llu,\"bytes\":%llu,\"seconds_left\":%lld}", g_cap_f ? "true" : "false", (unsigned long)g_cap_pid, p, (unsigned long long)g_cap_pkts, (unsigned long long)g_cap_bytes, g_cap_f ? (long long)(g_cap_until - now_ft()) / 10000000LL : 0LL); LeaveCriticalSection(&g_zlock); send_line(ci, out); return; }
+    else if (!strcmp(cmd, "capture")) {   /* capture <pid|all> [seconds] [file.pcapng] | capture stop [pid|all] | capture  (JSON: {"cmd":"capture","pid":N,"seconds":S,"path":"..."}) */
+        if (!strcmp(arg1, "stop")) {   /* capture stop: every capture; capture stop <pid>: that one; capture stop all: the 'all' capture */
+            int nd = !arg2[0] ? cap_stop(0, 1) : cap_stop(!strcmp(arg2, "all") ? 0 : (DWORD)strtoul(arg2, NULL, 10), 0);
+            snprintf(out, sizeof out, "{\"reply\":\"capture\",\"stopped\":%s,\"count\":%d}", nd ? "true" : "false", nd); send_line(ci, out); return; }
+        if (!arg1[0]) {   /* state: the newest capture in the 1.2 fields, every running one in captures[] */
+            char *cur = out, *end = out + sizeof out - 2; ULONGLONG now = now_ft(); char p[1200]; EnterCriticalSection(&g_zlock);
+            int n = 0, newest = -1; for (int k = 0; k < MAX_CAPS; k++) if (g_caps[k].f) { n++; if (newest < 0 || g_caps[k].started > g_caps[newest].started) newest = k; }
+            const Cap *t = newest >= 0 ? &g_caps[newest] : NULL; jw(t ? t->path : L"", p, sizeof p);
+            cur += snprintf(cur, end - cur, "{\"reply\":\"capture\",\"active\":%s,\"count\":%d,\"max\":%d,\"pid\":%lu,\"path\":\"%s\",\"packets\":%llu,\"bytes\":%llu,\"seconds_left\":%lld,\"captures\":[", t ? "true" : "false", n, MAX_CAPS, t ? (unsigned long)t->pid : 0UL, p, t ? (unsigned long long)t->pkts : 0ULL, t ? (unsigned long long)t->bytes : 0ULL, t ? (long long)(t->until - now) / 10000000LL : 0LL);
+            int first = 1; for (int k = 0; k < MAX_CAPS; k++) if (g_caps[k].f) { jw(g_caps[k].path, p, sizeof p); cur += snprintf(cur, end - cur, "%s{\"pid\":%lu,\"path\":\"%s\",\"packets\":%llu,\"bytes\":%llu,\"seconds_left\":%lld}", first ? "" : ",", (unsigned long)g_caps[k].pid, p, (unsigned long long)g_caps[k].pkts, (unsigned long long)g_caps[k].bytes, (long long)(g_caps[k].until - now) / 10000000LL); first = 0; }
+            LeaveCriticalSection(&g_zlock); cur += snprintf(cur, end - cur, "]}"); send_line(ci, out); return; }
         DWORD pid = !strcmp(arg1, "all") ? 0 : (DWORD)strtoul(arg1, NULL, 10); if (!pid && strcmp(arg1, "all")) { send_line(ci, "{\"reply\":\"error\",\"error\":\"usage: capture <pid|all> [seconds] [file.pcapng] | capture stop\"}"); return; }
         int secs = 30; char fileu[1200] = ""; if (line[0] == '{') { char s[32]; if (json_get_str(line, "seconds", s, sizeof s)) secs = atoi(s); json_get_str(line, "path", fileu, sizeof fileu); if (!strcmp(fileu, arg1)) fileu[0] = 0; } else if (arg2[0]) { secs = atoi(arg2); char *sp = strchr(arg2, ' '); if (sp) { while (*sp == ' ') sp++; strncpy(fileu, sp, sizeof fileu - 1); } if (secs <= 0) { secs = 30; if (!sp) strncpy(fileu, arg2, sizeof fileu - 1); } }
         wchar_t path[MAX_PATH]; if (fileu[0]) { to_wide(fileu, path, MAX_PATH); if (!wcschr(path, L'\\') && !wcschr(path, L'/')) { wchar_t tmp[MAX_PATH]; _snwprintf(tmp, MAX_PATH, L"%ls\\%ls", g_exe_dir, path); wcscpy(path, tmp); } } else { SYSTEMTIME st; GetLocalTime(&st); _snwprintf(path, MAX_PATH, L"%ls\\capture_%lu_%02d%02d%02d.pcapng", g_exe_dir, (unsigned long)pid, st.wHour, st.wMinute, st.wSecond); }
         char err[300] = ""; int ok = cap_start(pid, secs, path, err, sizeof err); char p[1200], e[600]; jw(path, p, sizeof p); json_escape(err, e, sizeof e);
         snprintf(out, sizeof out, "{\"reply\":\"capture\",\"ok\":%s,\"pid\":%lu,\"seconds\":%d,\"path\":\"%s\",\"error\":\"%s\",\"note\":\"a 'capture' event follows when the file is closed\"}", ok ? "true" : "false", (unsigned long)pid, secs, p, e); send_line(ci, out);
     }
-    else if (!strcmp(cmd, "zoom")) { EnterCriticalSection(&g_zlock); char *cur = out, *end = out + sizeof out - 2; cur += snprintf(cur, end - cur, "{\"reply\":\"zoom\",\"state\":\"%s\",\"error\":%lu,\"frames\":%lld,\"bytes\":%lld,\"matched\":%lld,\"unmatched\":%lld,\"capture_active\":%s,\"all\":%s,\"interest\":[", zoom_state_str(), (unsigned long)g_zoom_err, (long long)g_zoom_frames, (long long)g_zoom_bytes, (long long)g_zoom_matched, (long long)g_zoom_unmatched, g_cap_f ? "true" : "false", g_zoom_all ? "true" : "false"); for (int i = 0; i < g_nzoom; i++) cur += snprintf(cur, end - cur, "%s%lu", i ? "," : "", (unsigned long)g_zoom_pids[i]); LeaveCriticalSection(&g_zlock); cur += snprintf(cur, end - cur, "]}"); send_line(ci, out); }
+    else if (!strcmp(cmd, "zoom")) { EnterCriticalSection(&g_zlock); int caps = cap_active_locked(); char *cur = out, *end = out + sizeof out - 2; cur += snprintf(cur, end - cur, "{\"reply\":\"zoom\",\"state\":\"%s\",\"error\":%lu,\"frames\":%lld,\"bytes\":%lld,\"matched\":%lld,\"unmatched\":%lld,\"capture_active\":%s,\"captures\":%d,\"all\":%s,\"interest\":[", zoom_state_str(), (unsigned long)g_zoom_err, (long long)g_zoom_frames, (long long)g_zoom_bytes, (long long)g_zoom_matched, (long long)g_zoom_unmatched, caps ? "true" : "false", caps, g_zoom_all ? "true" : "false"); for (int i = 0; i < g_nzoom; i++) cur += snprintf(cur, end - cur, "%s%lu", i ? "," : "", (unsigned long)g_zoom_pids[i]); LeaveCriticalSection(&g_zlock); cur += snprintf(cur, end - cur, "]}"); send_line(ci, out); }
     else if (!strcmp(cmd, "audit")) { if (!strcmp(arg1, "on")) { int ok = audit_enable(); InterlockedExchange(&g_audit_ok, audit_query()); snprintf(out, sizeof out, "{\"reply\":\"audit\",\"enabled\":%s,\"set_ok\":%s,\"auto\":%s}", g_audit_ok == 1 ? "true" : "false", ok ? "true" : "false", g_audit_auto ? "true" : "false"); } else if (!strcmp(arg1, "auto")) { g_audit_auto = strcmp(arg2, "off") != 0; snprintf(out, sizeof out, "{\"reply\":\"audit\",\"enabled\":%s,\"auto\":%s}", g_audit_ok == 1 ? "true" : "false", g_audit_auto ? "true" : "false"); } else { InterlockedExchange(&g_audit_ok, audit_query()); snprintf(out, sizeof out, "{\"reply\":\"audit\",\"enabled\":%s,\"auto\":%s}", g_audit_ok == 1 ? "true" : "false", g_audit_auto ? "true" : "false"); } send_line(ci, out); }
     else if (!strcmp(cmd, "threshold")) { double tx = atof(arg1), rx = atof(arg2); if (tx > 0) g_tx_thresh = tx; if (rx > 0) g_rx_thresh = rx; snprintf(out, sizeof out, "{\"reply\":\"threshold\",\"tx_mbps\":%.2f,\"rx_mbps\":%.2f}", g_tx_thresh, g_rx_thresh); send_line(ci, out); }
     else if (!strcmp(cmd, "local")) { InterlockedExchange(&g_include_local, !strcmp(arg1, "on")); if (g_main) InvalidateRect(g_main, NULL, TRUE); snprintf(out, sizeof out, "{\"reply\":\"local\",\"include_local\":%s}", g_include_local ? "true" : "false"); send_line(ci, out); }
     else if (!strcmp(cmd, "pause")) { InterlockedExchange(&g_paused, strcmp(arg1, "off") != 0); snprintf(out, sizeof out, "{\"reply\":\"pause\",\"paused\":%s}", g_paused ? "true" : "false"); send_line(ci, out); }
     else if (!strcmp(cmd, "reset")) { EnterCriticalSection(&g_lock); memset(g_procs, 0, sizeof g_procs); memset(g_pidx, 0, sizeof g_pidx); memset(g_conns, 0, sizeof g_conns); memset(g_chash, 0, sizeof g_chash); g_tx_total = g_rx_total = 0; LeaveCriticalSection(&g_lock); send_line(ci, "{\"reply\":\"reset\",\"ok\":true}"); }
     else if (!strcmp(cmd, "show")) { if (g_main) PostMessageW(g_main, WM_SHOWME, 0, 0); send_line(ci, "{\"reply\":\"show\",\"ok\":true}"); }
-    else if (!strcmp(cmd, "help")) send_line(ci, "{\"reply\":\"help\",\"commands\":[\"status\",\"whoami\",\"clients\",\"list\",\"inspect <pid>\",\"conns [pid]\",\"watch <pid|all> [packets|off]\",\"watch off\",\"capture <pid|all> [seconds] [file.pcapng]\",\"capture stop\",\"zoom\",\"kill <pid>\",\"block <pid|path>\",\"unblock <pid|path>\",\"blocks\",\"trust [list|remove <substr>|clear]\",\"denials\",\"pardon <path-substr>\",\"history [minutes]\",\"snap [file.bmp]\",\"resolve <ip>\",\"audit [on|status|auto on|auto off]\",\"threshold <tx_mbps> [rx_mbps]\",\"local on|off\",\"pause on|off\",\"reset\",\"show\",\"help\"],\"events\":[\"hello\",\"auth\",\"tick\",\"spike\",\"conn\",\"flow\",\"pkt\",\"trace\",\"capture\",\"killed\",\"blocked\",\"unblocked\",\"intruder\",\"audit\",\"snap\",\"client\"],\"json_form\":\"{\\\"cmd\\\":\\\"kill\\\",\\\"pid\\\":123}\"}");
+    else if (!strcmp(cmd, "help")) send_line(ci, "{\"reply\":\"help\",\"commands\":[\"status\",\"whoami\",\"clients\",\"list\",\"inspect <pid> [show]\",\"conns [pid|all] [active] [since <now>] [cursor <n>] [limit <n>]\",\"watch <pid|all> [packets|handshakes|nopackets|off]\",\"watch packets|handshakes|nopackets\",\"watch off\",\"capture <pid|all> [seconds] [file.pcapng]\",\"capture stop [pid|all]\",\"capture\",\"zoom\",\"kill <pid>\",\"block <pid|path>\",\"unblock <pid|path>\",\"blocks\",\"trust [list|remove <substr>|clear]\",\"denials\",\"pardon <path-substr>\",\"history [minutes]\",\"snap [file.bmp] [pid]\",\"resolve <ip>\",\"audit [on|status|auto on|auto off]\",\"threshold <tx_mbps> [rx_mbps]\",\"local on|off\",\"pause on|off\",\"reset\",\"show\",\"help\"],\"events\":[\"hello\",\"auth\",\"tick\",\"spike\",\"conn\",\"flow\",\"flowinfo\",\"pkt\",\"trace\",\"capture\",\"killed\",\"blocked\",\"unblocked\",\"intruder\",\"audit\",\"snap\",\"client\"],\"json_form\":\"{\\\"cmd\\\":\\\"kill\\\",\\\"pid\\\":123}\"}");
     else { char cesc[80]; json_escape(cmd, cesc, sizeof cesc); snprintf(out, sizeof out, "{\"reply\":\"error\",\"error\":\"unknown command '%s' (try help)\"}", cesc); send_line(ci, out); }
+}
+/* Commands run on CMD_WORKERS threads so a slow one (inspect takes up to a second) never stalls other clients. One command per client runs at a
+   time and the queue is served in arrival order, so each client's replies come back in the order it sent its commands. */
+static void job_push(int ci, DWORD gen, const char *line) {
+    EnterCriticalSection(&g_jlock); int slot = -1; for (int i = 0; i < JOB_RING; i++) if (!g_jobs[i].used) { slot = i; break; }
+    if (slot >= 0) { Job *j = &g_jobs[slot]; j->used = 1; j->ci = ci; j->gen = gen; j->seq = ++g_job_seq; strncpy(j->line, line, CLIENT_LINE_MAX - 1); j->line[CLIENT_LINE_MAX - 1] = 0; WakeConditionVariable(&g_jcv); }
+    LeaveCriticalSection(&g_jlock);
+    if (slot < 0) send_line(ci, "{\"reply\":\"error\",\"error\":\"command queue full, try again\"}");
+}
+static DWORD WINAPI cmd_worker(LPVOID a) {
+    (void)a; char *big = (char *)malloc(CMD_BIG); if (!big) return 0; static Job cur[CMD_WORKERS]; static volatile LONG next_slot; Job *j = &cur[InterlockedIncrement(&next_slot) - 1];   /* each worker owns one 4 KB job copy */
+    for (;;) {
+        EnterCriticalSection(&g_jlock); int pick;
+        for (;;) { ULONGLONG best = ~0ULL; pick = -1; for (int i = 0; i < JOB_RING; i++) if (g_jobs[i].used && !g_cmd_busy[g_jobs[i].ci] && g_jobs[i].seq < best) { best = g_jobs[i].seq; pick = i; } if (pick >= 0 || g_quitting) break; SleepConditionVariableCS(&g_jcv, &g_jlock, INFINITE); }
+        if (pick < 0) { LeaveCriticalSection(&g_jlock); break; }
+        *j = g_jobs[pick]; g_jobs[pick].used = 0; g_cmd_busy[j->ci] = 1; LeaveCriticalSection(&g_jlock);
+        int live; EnterCriticalSection(&g_clock); live = g_clients[j->ci].s != INVALID_SOCKET && g_clients[j->ci].gen == j->gen && g_clients[j->ci].state == 2; LeaveCriticalSection(&g_clock);
+        if (live) handle_command(j->ci, j->line, big, CMD_BIG);
+        EnterCriticalSection(&g_jlock); g_cmd_busy[j->ci] = 0; WakeAllConditionVariable(&g_jcv); LeaveCriticalSection(&g_jlock);
+    }
+    free(big); return 0;
 }
 static DWORD WINAPI sock_thread(LPVOID a) {
     (void)a; for (int i = 0; i < MAX_CLIENTS; i++) g_clients[i].s = INVALID_SOCKET;
@@ -1148,7 +1242,7 @@ static DWORD WINAPI sock_thread(LPVOID a) {
                 if (decision == 1) { g_attempts[g_attempt_i++ % 32] = now; if (attempts_recent() > 10) { g_auth_suspended_until = now + 300000; decision = 3; why = "flood"; log_json("{\"ev\":\"auth\",\"status\":\"suspended\",\"why\":\"more than 10 connection attempts in 60 s\"}"); tray_balloon(L"Hodometer: connection flood", L"More than 10 programs asked for control within a minute. Prompts are suspended for 5 minutes; all new unknown clients are denied.", 1); } }
                 int placed = -1;
                 EnterCriticalSection(&g_clock);
-                for (int i = 0; i < MAX_CLIENTS; i++) if (g_clients[i].s == INVALID_SOCKET) { Client *cl = &g_clients[i]; memset(cl, 0, sizeof *cl); cl->s = c; cl->since = now; cl->pid = pid; cl->ppid = parent_pid(pid); wcscpy(cl->path, path); wcsncpy(cl->name, path[0] ? basename_w(path) : L"(unknown)", 63); strcpy(cl->sha, sha); cl->state = decision == 2 ? 2 : decision == 3 ? 3 : 1; placed = i; break; }
+                for (int i = 0; i < MAX_CLIENTS; i++) if (g_clients[i].s == INVALID_SOCKET && !g_cmd_busy[i]) { Client *cl = &g_clients[i]; memset(cl, 0, sizeof *cl); cl->s = c; cl->gen = ++g_client_gen; cl->since = now; cl->pid = pid; cl->ppid = parent_pid(pid); wcscpy(cl->path, path); wcsncpy(cl->name, path[0] ? basename_w(path) : L"(unknown)", 63); strcpy(cl->sha, sha); cl->state = decision == 2 ? 2 : decision == 3 ? 3 : 1; placed = i; break; }
                 LeaveCriticalSection(&g_clock);
                 if (placed < 0) closesocket(c);
                 else if (decision == 3) { if (path[0]) deny_record(path, why); else { char l[200]; snprintf(l, sizeof l, "{\"ev\":\"auth\",\"status\":\"denied\",\"why\":\"%s\"}", why); log_json(l); } }
@@ -1160,10 +1254,10 @@ static DWORD WINAPI sock_thread(LPVOID a) {
             if (s == INVALID_SOCKET || !FD_ISSET(s, &rf)) { LeaveCriticalSection(&g_clock); continue; }
             char tmp[1024]; int n = recv(s, tmp, sizeof tmp, 0);
             if (n <= 0) { client_drop(i); LeaveCriticalSection(&g_clock); continue; }
-            static char lines[16][CLIENT_LINE_MAX]; int nl = 0, allowed = cl->state == 2;
+            static char lines[16][CLIENT_LINE_MAX]; int nl = 0, allowed = cl->state == 2; DWORD gen = cl->gen;
             for (int k = 0; k < n; k++) { char ch = tmp[k]; if (ch == '\n') { cl->buf[cl->len] = 0; if (nl < 16) strcpy(lines[nl++], cl->buf); cl->len = 0; } else if (cl->len < CLIENT_LINE_MAX - 1) cl->buf[cl->len++] = ch; else cl->len = 0; }
             LeaveCriticalSection(&g_clock);
-            for (int k = 0; k < nl; k++) { if (allowed) handle_command(i, lines[k]); else send_line(i, "{\"reply\":\"error\",\"error\":\"not allowed yet\"}"); }   /* commands run outside the client lock (they may take seconds) */
+            for (int k = 0; k < nl; k++) { if (allowed) job_push(i, gen, lines[k]); else send_line(i, "{\"reply\":\"error\",\"error\":\"not allowed yet\"}"); }   /* commands run on the worker threads, never on this one */
         }
     }
     closesocket(ls); return 0;
@@ -1439,9 +1533,9 @@ static void tick(void) {
     g_snap_n = 0; for (int i = 0; i < MAX_PROCS; i++) { const Proc *p = &g_procs[i]; if (p->used && (p->tx_total || p->rx_total)) g_snap[g_snap_n++] = *p; }
     LeaveCriticalSection(&g_lock);
     qsort(g_snap, g_snap_n, sizeof(Proc), cmp_snap); InterlockedExchange(&g_conn_this_sec, 0);
-    EnterCriticalSection(&g_clock); for (int i = 0; i < MAX_CLIENTS; i++) g_clients[i].pkt_budget = 200; LeaveCriticalSection(&g_clock);   /* at most 200 pkt events per watcher per second */
+    EnterCriticalSection(&g_clock); for (int i = 0; i < MAX_CLIENTS; i++) g_clients[i].pkt_budget = PKT_BUDGET; LeaveCriticalSection(&g_clock);   /* at most PKT_BUDGET pkt events per watcher per second */
     if (InterlockedExchange(&g_watch_dirty, 0)) zoom_recalc();
-    { int expired; EnterCriticalSection(&g_zlock); expired = g_cap_f && now_ft() > g_cap_until; LeaveCriticalSection(&g_zlock); if (expired) cap_stop(); }
+    cap_expire();
     if (g_zoom_idle_since && g_zoom_state == 2 && now - g_zoom_idle_since > 30000) { int idle; EnterCriticalSection(&g_zlock); idle = g_nzoom == 0 && !g_zoom_all; LeaveCriticalSection(&g_zlock); if (idle) { zoom_stop(); g_zoom_idle_since = 0; } }
     g_spark_tx[g_spark_i] = g_tx_rate; g_spark_rx[g_spark_i] = g_rx_rate; g_spark_i = (g_spark_i + 1) % SPARK_N;
     odo_set(g_odo_tx, g_tx_total, g_tx_rate); odo_set(g_odo_rx, g_rx_total, g_rx_rate);
@@ -1496,13 +1590,14 @@ static int cmp_conn(const void *a, const void *b);
 static void apply_dark_titlebar(HWND h);
 static int build_inspect_json(DWORD pid, char *out, int n, int live_ok) {   /* everything the Inspector shows, as one JSON object (socket 'inspect', Copy JSON button) */
     char *cur = out, *end = out + n - 2; Insp *live = live_ok ? insp_find(pid) : NULL; Profile tmp, *pf; int nactive = 0; uint64_t tx_total = 0, rx_total = 0, retx = 0; double tx_rate = 0, rx_rate = 0; int blocked = 0; DWORD fails = 0;
-    if (live) pf = &live->pf; else { profile_init(&tmp, pid); profile_sample(&tmp); Sleep(150); profile_sample(&tmp); if (tmp.path[0]) tmp.sig = exe_signer(tmp.path, tmp.signer, 160); conns_seed(pid); estats_refresh(pid); pf = &tmp; }
+    char sha[65] = "";
+    if (live) { pf = &live->pf; if (pf->path[0]) sha256_file(pf->path, sha); } else { profile_init(&tmp, pid); profile_sample(&tmp); Sleep(150); profile_sample(&tmp); if (tmp.path[0]) tmp.sig = exe_signer_cached(tmp.path, tmp.signer, 160, sha); conns_seed(pid); estats_refresh(pid); pf = &tmp; }
     EnterCriticalSection(&g_lock); Proc *p = proc_find(pid); if (p) { tx_total = p->tx_total; rx_total = p->rx_total; tx_rate = p->tx_rate; rx_rate = p->rx_rate; retx = p->retx; blocked = p->blocked; fails = p->fails; nactive = (int)p->nconn; } LeaveCriticalSection(&g_lock);
     char nm[200], path[1200], cmd[3200], user[400], par[200], signer[400], started[40] = "";
     jw(pf->name, nm, sizeof nm); jw(pf->path, path, sizeof path); jw(pf->cmdline, cmd, sizeof cmd); jw(pf->user, user, sizeof user); jw(pf->parent, par, sizeof par); jw(pf->signer, signer, sizeof signer);
     if (pf->created.dwLowDateTime || pf->created.dwHighDateTime) ft_iso(((ULONGLONG)pf->created.dwHighDateTime << 32) | pf->created.dwLowDateTime, started, sizeof started);
-    cur += snprintf(cur, end - cur, "{\"reply\":\"inspect\",\"pid\":%lu,\"name\":\"%s\",\"path\":\"%s\",\"cmdline\":\"%s\",\"user\":\"%s\",\"integrity\":\"%ls\",\"parent\":{\"pid\":%lu,\"name\":\"%s\"},\"started\":\"%s\",\"alive\":%s,\"protected\":%s,\"blocked\":%s,\"signer\":{\"state\":\"%s\",\"name\":\"%s\"},",
-        (unsigned long)pid, nm, path, cmd, user, pf->integrity, (unsigned long)pf->ppid, par, started, pf->alive ? "true" : "false", pf->protect ? "true" : "false", blocked ? "true" : "false", pf->sig == 1 ? "signed" : pf->sig == 2 ? "unsigned" : pf->sig == 3 ? "untrusted" : "pending", signer);
+    cur += snprintf(cur, end - cur, "{\"reply\":\"inspect\",\"pid\":%lu,\"name\":\"%s\",\"path\":\"%s\",\"sha256\":\"%s\",\"cmdline\":\"%s\",\"user\":\"%s\",\"integrity\":\"%ls\",\"parent\":{\"pid\":%lu,\"name\":\"%s\"},\"started\":\"%s\",\"alive\":%s,\"protected\":%s,\"blocked\":%s,\"signer\":{\"state\":\"%s\",\"name\":\"%s\"},",
+        (unsigned long)pid, nm, path, sha, cmd, user, pf->integrity, (unsigned long)pf->ppid, par, started, pf->alive ? "true" : "false", pf->protect ? "true" : "false", blocked ? "true" : "false", pf->sig == 1 ? "signed" : pf->sig == 2 ? "unsigned" : pf->sig == 3 ? "untrusted" : "pending", signer);
     cur += snprintf(cur, end - cur, "\"cpu_pct\":%.1f,\"cpu_time_ms\":%llu,\"working_set\":%llu,\"private_bytes\":%llu,\"disk_read_bps\":%.0f,\"disk_write_bps\":%.0f,\"gpu_pct\":%s%.1f%s,\"handles\":%lu,\"threads\":%lu,\"children\":%lu,",
         pf->cpu, (unsigned long long)pf->cpu_ms, (unsigned long long)pf->ws, (unsigned long long)pf->priv, pf->rd_bps, pf->wr_bps, pf->gpu_ok ? "" : "null", pf->gpu_ok ? pf->gpu : 0.0, pf->gpu_ok ? "" : "", (unsigned long)pf->handles, (unsigned long)pf->threads, (unsigned long)pf->children);
     if (!pf->gpu_ok) { char *q = strstr(out, "\"gpu_pct\":null0.0"); if (q) { memmove(q + 14, q + 17, strlen(q + 17) + 1); cur -= 3; } }
@@ -1605,7 +1700,7 @@ static void insp_tick(Insp *ins) {
     EnterCriticalSection(&g_zlock);
     ins->npkts = 0; unsigned cnt = g_pkt_head < PKT_RING ? g_pkt_head : PKT_RING; for (unsigned k = cnt; k >= 1; k--) { const Pkt *q = &g_pkts[(g_pkt_head - k) % PKT_RING]; if (q->pid == pid && ins->npkts < PKT_RING) ins->pkts[ins->npkts++] = *q; }
     ins->ntrace = 0; cnt = g_trace_head < TRACE_RING ? g_trace_head : TRACE_RING; for (unsigned k = cnt; k >= 1; k--) { const TraceEv *t = &g_trace[(g_trace_head - k) % TRACE_RING]; if ((t->pid == pid || (t->kind == 1 && t->ppid == pid)) && ins->ntrace < 1024) ins->trace[ins->ntrace++] = *t; }
-    int cap_mine = g_cap_f && g_cap_pid == pid;
+    int cap_mine = cap_for_pid_locked(pid) >= 0;
     LeaveCriticalSection(&g_zlock);
     ListView_SetItemCountEx(ins->lv[0], ins->nconns, LVSICF_NOINVALIDATEALL | LVSICF_NOSCROLL);
     ListView_SetItemCountEx(ins->lv[1], ins->npkts, LVSICF_NOINVALIDATEALL | LVSICF_NOSCROLL); if (ins->npkts != oldp && ins->npkts && ListView_GetNextItem(ins->lv[1], -1, LVNI_SELECTED) < 0) ListView_EnsureVisible(ins->lv[1], ins->npkts - 1, FALSE);
@@ -1643,7 +1738,7 @@ static void insp_paint(Insp *ins, HDC dc, int W, int H) {
         HPEN grid = CreatePen(PS_SOLID, 1, C_BORDER); HGDIOBJ gop = SelectObject(mdc, grid); for (int k = 1; k < 4; k++) { int yy = top + (bottom - top) * k / 4; MoveToEx(mdc, left, yy, NULL); LineTo(mdc, rgt, yy); } SelectObject(mdc, gop); DeleteObject(grid);
         for (int series = 0; series < 2; series++) { double *v = series ? ins->spark_tx : ins->spark_rx; COLORREF col = series ? C_GREEN : C_BLUE, fillc = series ? RGB(34, 62, 46) : RGB(34, 48, 70); POINT pts[ISPARK_N + 2]; int n = 0; for (int i = 0; i < ISPARK_N; i++) { double val = v[(ins->spark_i + i) % ISPARK_N]; pts[n].x = left + (int)(i * sx); pts[n].y = bottom - (int)((bottom - top) * (val / mx)); n++; } pts[n].x = rgt; pts[n].y = bottom; n++; pts[n].x = left; pts[n].y = bottom; n++; HBRUSH fb = CreateSolidBrush(fillc); HPEN fp = CreatePen(PS_NULL, 0, 0); HGDIOBJ obr2 = SelectObject(mdc, fb), opp = SelectObject(mdc, fp); Polygon(mdc, pts, n); SelectObject(mdc, obr2); SelectObject(mdc, opp); DeleteObject(fb); DeleteObject(fp); HPEN lp = CreatePen(PS_SOLID, 2, col); opp = SelectObject(mdc, lp); Polyline(mdc, pts, n - 2); SelectObject(mdc, opp); DeleteObject(lp); }
         SelectObject(mdc, g_font_small); SetTextColor(mdc, C_MUTED); fmt_rate_w(mx, a, 48); _snwprintf(t, 1400, L"LAST 2 MINUTES   scale %ls", a); r = (RECT){ left, 12, rgt, 28 }; DrawTextW(mdc, t, -1, &r, DT_LEFT | DT_SINGLELINE); }
-    { SelectObject(mdc, g_font); wchar_t cap[400] = L""; EnterCriticalSection(&g_zlock); if (g_cap_f) { long long left_s = (long long)(g_cap_until - now_ft()) / 10000000LL; if (left_s < 0) left_s = 0; _snwprintf(cap, 400, L"     pcapng: writing %ls  (%I64u packets, %lld s left)", basename_w(g_cap_path), (unsigned long long)g_cap_pkts, left_s); } else if (g_cap_path[0]) _snwprintf(cap, 400, L"     last pcapng: %ls  (%I64u packets)", g_cap_path, (unsigned long long)g_cap_pkts); LeaveCriticalSection(&g_zlock);
+    { SelectObject(mdc, g_font); wchar_t cap[400] = L""; EnterCriticalSection(&g_zlock); int ck = cap_for_pid_locked(ins->pid), others = cap_active_locked() - (ck >= 0); if (ck >= 0) { long long left_s = (long long)(g_caps[ck].until - now_ft()) / 10000000LL; if (left_s < 0) left_s = 0; _snwprintf(cap, 400, L"     pcapng: writing %ls  (%I64u packets, %lld s left)%ls", basename_w(g_caps[ck].path), (unsigned long long)g_caps[ck].pkts, left_s, others ? L"  +other captures running" : L""); } else if (g_cap_last.path[0]) _snwprintf(cap, 400, L"     last pcapng: %ls  (%I64u packets)", g_cap_last.path, (unsigned long long)g_cap_last.pkts); LeaveCriticalSection(&g_zlock);
         COLORREF zc = g_zoom_state == 2 ? C_GREEN : g_zoom_state == 1 ? C_AMBER : g_zoom_state == -1 ? C_RED : C_MUTED; dot(mdc, 22, H - 22, zc); SetTextColor(mdc, C_TEXT);
         if (g_zoom_state == -1) _snwprintf(t, 1400, L"Packet zoom ERROR %lu (ndiscap.sys / ETW session)%ls", (unsigned long)g_zoom_err, cap); else _snwprintf(t, 1400, L"Packet zoom %hs   frames %I64d   matched %I64d   unmatched %I64d%ls", zoom_state_str(), (long long)g_zoom_frames, (long long)g_zoom_matched, (long long)g_zoom_unmatched, cap);
         r = (RECT){ 34, H - 36, W - 16, H - 8 }; DrawTextW(mdc, t, -1, &r, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS); }
@@ -1685,7 +1780,7 @@ static LRESULT CALLBACK InspProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_COMMAND:
         switch (LOWORD(w)) {
         case IDC_I_TAB0: insp_set_tab(ins, 0); return 0; case IDC_I_TAB1: insp_set_tab(ins, 1); return 0; case IDC_I_TAB2: insp_set_tab(ins, 2); return 0;
-        case IDC_I_CAP: { int mine; EnterCriticalSection(&g_zlock); mine = g_cap_f && g_cap_pid == ins->pid; LeaveCriticalSection(&g_zlock); if (mine) cap_stop(); else { SYSTEMTIME st; GetLocalTime(&st); wchar_t path[MAX_PATH], nm[64]; wcsncpy(nm, ins->name[0] ? ins->name : L"process", 63); nm[63] = 0; for (wchar_t *q = nm; *q; q++) if (wcschr(L"\\/:*?\"<>| ", *q)) *q = L'_'; _snwprintf(path, MAX_PATH, L"%ls\\capture_%ls_%lu_%02d%02d%02d.pcapng", g_exe_dir, nm, (unsigned long)ins->pid, st.wHour, st.wMinute, st.wSecond); char err[300]; if (!cap_start(ins->pid, 30, path, err, sizeof err)) { wchar_t e[300]; to_wide(err, e, 300); MessageBoxW(h, e, L"Hodometer", MB_OK | MB_ICONERROR); } } insp_tick(ins); return 0; }
+        case IDC_I_CAP: { int mine; EnterCriticalSection(&g_zlock); mine = cap_for_pid_locked(ins->pid) >= 0; LeaveCriticalSection(&g_zlock); if (mine) cap_stop(ins->pid, 0); else { SYSTEMTIME st; GetLocalTime(&st); wchar_t path[MAX_PATH], nm[64]; wcsncpy(nm, ins->name[0] ? ins->name : L"process", 63); nm[63] = 0; for (wchar_t *q = nm; *q; q++) if (wcschr(L"\\/:*?\"<>| ", *q)) *q = L'_'; _snwprintf(path, MAX_PATH, L"%ls\\capture_%ls_%lu_%02d%02d%02d.pcapng", g_exe_dir, nm, (unsigned long)ins->pid, st.wHour, st.wMinute, st.wSecond); char err[300]; if (!cap_start(ins->pid, 30, path, err, sizeof err)) { wchar_t e[300]; to_wide(err, e, 300); MessageBoxW(h, e, L"Hodometer", MB_OK | MB_ICONERROR); } } insp_tick(ins); return 0; }
         case IDC_I_COPY: { char *js = (char *)malloc(600000); if (js) { build_inspect_json(ins->pid, js, 600000, 1); wchar_t *wj = (wchar_t *)malloc(600000 * sizeof(wchar_t)); if (wj) { to_wide(js, wj, 600000); copy_text(wj); free(wj); } free(js); } return 0; }
         case IDC_I_KILL: { wchar_t q[400]; _snwprintf(q, 400, L"Kill %ls (pid %lu)?\n\n%ls", ins->name, (unsigned long)ins->pid, ins->pf.path); if (MessageBoxW(h, q, L"Hodometer", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) return 0; char err[160] = ""; if (!kill_pid(ins->pid, err, sizeof err)) { wchar_t e[200]; to_wide(err, e, 200); MessageBoxW(h, e, L"Hodometer", MB_OK | MB_ICONERROR); } else { char js[96]; snprintf(js, sizeof js, "{\"ev\":\"killed\",\"pid\":%lu,\"by\":\"ui\"}", (unsigned long)ins->pid); bcast(js); } return 0; }
         case IDC_I_BLOCK: { if (!ins->pf.path[0]) { MessageBoxW(h, L"No program path known for this process.", L"Hodometer", MB_OK | MB_ICONERROR); return 0; } int block = !ins->blocked; wchar_t q[500]; _snwprintf(q, 500, L"%ls all network access for\n%ls\n\n%ls", block ? L"Block" : L"Unblock", ins->name, ins->pf.path); if (MessageBoxW(h, q, L"Hodometer", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) return 0; char err[160] = ""; if (!fw_block(ins->pf.path, block, err, sizeof err)) { wchar_t e[200]; to_wide(err, e, 200); MessageBoxW(h, e, L"Hodometer", MB_OK | MB_ICONERROR); } else { char p[1200]; jw(ins->pf.path, p, sizeof p); char js[1400]; snprintf(js, sizeof js, "{\"ev\":\"%s\",\"path\":\"%s\",\"by\":\"ui\"}", block ? "blocked" : "unblocked", p); bcast(js); } return 0; }
@@ -1797,7 +1892,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
     if (!is_elevated()) { wchar_t exe[MAX_PATH]; GetModuleFileNameW(NULL, exe, MAX_PATH); wchar_t args[512] = L""; for (int i = 1; i < argc; i++) { wcscat(args, argv[i]); wcscat(args, L" "); } ReleaseMutex(mutex); CloseHandle(mutex); HINSTANCE r = ShellExecuteW(NULL, L"runas", exe, args, NULL, SW_SHOWNORMAL); if ((INT_PTR)r <= 32) MessageBoxW(NULL, L"Hodometer needs administrator rights (kernel network trace, audit policy, Security log, firewall rules).", L"Hodometer", MB_OK | MB_ICONERROR); return 0; }
     GetModuleFileNameW(NULL, g_exe_dir, MAX_PATH); { wchar_t *s = wcsrchr(g_exe_dir, L'\\'); if (s) *s = 0; }
     _snwprintf(g_log_path, MAX_PATH, L"%ls\\hodometer.log", g_exe_dir); _snwprintf(g_hist_path, MAX_PATH, L"%ls\\history.jsonl", g_exe_dir); _snwprintf(g_trust_path, MAX_PATH, L"%ls\\trusted.jsonl", g_exe_dir); _snwprintf(g_block_path, MAX_PATH, L"%ls\\blocked.jsonl", g_exe_dir);
-    SetProcessDPIAware(); InitializeCriticalSection(&g_lock); InitializeCriticalSection(&g_clock); InitializeCriticalSection(&g_hlock); InitializeCriticalSection(&g_tlock); InitializeCriticalSection(&g_zlock);
+    SetProcessDPIAware(); InitializeCriticalSection(&g_lock); InitializeCriticalSection(&g_clock); InitializeCriticalSection(&g_hlock); InitializeCriticalSection(&g_tlock); InitializeCriticalSection(&g_zlock); InitializeCriticalSection(&g_jlock); InitializeCriticalSection(&g_slock); InitializeConditionVariable(&g_jcv);
     WSADATA wsa; WSAStartup(MAKEWORD(2, 2), &wsa); INITCOMMONCONTROLSEX icc = { sizeof icc, ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES }; InitCommonControlsEx(&icc); dark_mode_init();
     g_font = CreateFontW(-15, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI"); g_font_b = CreateFontW(-15, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI"); g_font_small = CreateFontW(-13, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
     trust_load(); blocked_load(); audit_init(); audit_check(1);
@@ -1813,7 +1908,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
     apply_dark_titlebar(hw); SendMessageW(hw, WM_SETICON, ICON_SMALL, (LPARAM)g_icon_small); SendMessageW(hw, WM_SETICON, ICON_BIG, (LPARAM)g_icon_big);
     tray_add();
     CloseHandle(CreateThread(NULL, 0, etw_thread, NULL, 0, NULL)); CloseHandle(CreateThread(NULL, 0, sock_thread, NULL, 0, NULL)); CloseHandle(CreateThread(NULL, 0, ptr_thread, NULL, 0, NULL)); security_subscribe();
+    for (int i = 0; i < CMD_WORKERS; i++) { HANDLE t = CreateThread(NULL, 0, cmd_worker, NULL, 0, NULL); if (t) CloseHandle(t); }
     if (start_visible) { ShowWindow(hw, SW_SHOWNORMAL); UpdateWindow(hw); }
     MSG msg; while (GetMessageW(&msg, NULL, 0, 0) > 0) { if (!g_auth_dlg || !IsDialogMessageW(g_auth_dlg, &msg)) { TranslateMessage(&msg); DispatchMessageW(&msg); } }
-    g_quitting = 1; etw_stop(); zoom_stop(); cap_stop(); log_json("{\"ev\":\"stop\"}"); WSACleanup(); ReleaseMutex(mutex); CloseHandle(mutex); return 0;
+    g_quitting = 1; WakeAllConditionVariable(&g_jcv); etw_stop(); zoom_stop(); cap_stop(0, 1); log_json("{\"ev\":\"stop\"}"); WSACleanup(); ReleaseMutex(mutex); CloseHandle(mutex); return 0;
 }

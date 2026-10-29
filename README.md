@@ -1,4 +1,4 @@
-# Hodometer 1.2
+# Hodometer 1.3
 
 A single-file native Windows tray application (C, Win32, no runtime) that shows exactly which program is sending and
 receiving bytes and to which host, keeps Windows connection auditing switched on, lets you or an AI agent kill a
@@ -9,6 +9,13 @@ explicitly allowed can use.
 its packets decoded on the wire (TLS SNI/ALPN, QUIC, DNS, HTTP), a process profile (CPU, memory, disk, GPU, user,
 command line, signer) and a timeline (connects, failures, child processes, DLL loads), with pcapng export. All of it
 comes from Windows' own kernel providers and `ndiscap.sys`; there is no driver to install.
+
+1.3 makes the socket fit for many agents at once (the Sentinel design in `SENTINEL.md`): commands run on worker
+threads, so a slow `inspect` from one client no longer stalls the others; up to four pcapng captures run at the same
+time, one per process; `conns` pages through every flow and can filter to active flows or flows touched since a
+timestamp; a watcher can ask for decoded handshakes only instead of every frame; a `flowinfo` event announces each
+flow's SNI, ALPN, HTTP request or TLS version the moment it is decoded; each connection may watch 64 processes;
+`inspect` reports the file's SHA-256 and caches signature checks.
 
 ## What it does
 
@@ -59,8 +66,9 @@ socket. Up to eight Inspector windows can be open; each follows one pid.
   bursts, TLS hellos, DNS queries, HTTP requests, QUIC hellos, child processes the inspected process started, image (DLL)
   loads while inspected, process exit, finished captures.
 - **Capture 30 s → pcapng.** Writes just this process's frames to `capture_<name>_<pid>_<time>.pcapng` next to the exe;
-  opens in Wireshark. **Copy JSON** puts the whole Inspector state on the clipboard (the `inspect` reply). **Kill** and
-  **Block** act on this process.
+  opens in Wireshark. Up to four captures (one per process, or one for every process) can run at once; the header shows
+  this process's capture and notes when others are running. **Copy JSON** puts the whole Inspector state on the clipboard
+  (the `inspect` reply). **Kill** and **Block** act on this process.
 
 How it works: frames come from Windows' own `ndiscap.sys` (the Microsoft-Windows-NDIS-PacketCapture provider behind
 `netsh trace`) through a second ETW session, `HodometerZoom`, which runs only while an Inspector is open, a socket
@@ -89,7 +97,8 @@ rejected. `pardon <substring>` clears a program's denial record and any firewall
 ## Install / run
 
 - `build.ps1` builds `Hodometer.exe` with MinGW-w64 (WinLibs gcc + windres); links ws2_32, iphlpapi, dnsapi, advapi32,
-  shell32, user32, gdi32, comctl32, ole32, psapi, pdh, wintrust, crypt32 and bcrypt, statically.
+  shell32, user32, gdi32, comctl32, ole32, psapi, pdh, wintrust, crypt32 and bcrypt, statically. `build.ps1 -Out
+  Hodometer-new.exe` builds under another name while `Hodometer.exe` is running (the running exe is locked).
 - `install.ps1` (run as administrator once) registers the logon task **Hodometer** (elevated, no UAC prompt), puts a
   Desktop shortcut that starts that task, retires the older script watcher and starts the app.
 - Options: `--port N` (default 48201), `--tx MBPS`, `--rx MBPS`, `--auth-timeout SECONDS`, `--show`, `--local`,
@@ -101,6 +110,10 @@ rejected. `pardon <substring>` clears a program's denial record and any firewall
 
 TCP `127.0.0.1:48201`, newline-delimited JSON. Connect, wait for `auth` to say `allowed` (the user clicks the prompt),
 then read events and write commands as plain words or JSON (`{"cmd":"kill","pid":123}`, `{"cmd":"block","path":"..."}`).
+Commands run on four worker threads: different clients are served in parallel, each client's own commands run one at a
+time in the order it sent them, so replies come back in command order (events interleave; match a reply by its `reply`
+field). A client with more than 128 commands queued across all clients gets `{"reply":"error","error":"command queue
+full, try again"}`. Up to 32 clients.
 
 Events:
 
@@ -112,9 +125,10 @@ Events:
 | `spike` | burst over threshold (10 s hold) | `kind`, `tx_mbps`, `rx_mbps`, `top[]` |
 | `conn` | each outbound connection (Security 5156) | `pid`, `app`, `path` (NT device path), `dst`, `host`, `port`, `proto` |
 | `flow` | watched pid: connection lifecycle | `pid`, `kind` (`connect`, `established` +`connect_ms`, `closed` +`tx`/`rx`, `failed` +`error`, `retransmit` +`bytes`, `reconnect`), `proto`, `lport`, `remote`, `port`, `host` |
-| `pkt` | watched pid with `packets`: each frame (max 200/s per client) | `pid`, `t`, `dir`, `proto`, `lport`, `remote`, `port`, `host`, `len`, `flags`, `info` (the decode) |
+| `flowinfo` | watched pid: a flow's identity was just decoded (once per flow; twice at most) | the same fields as a `conns` entry: `pid`, `proto`, `lport`, `remote`, `port`, `host`, `state`, `sni`, `alpn`, `tls`, `quic`, `http`, bytes, RTT... Sent on a TLS or QUIC ClientHello with SNI or ALPN, on the first plaintext HTTP request, and on a TLS ServerHello when no ClientHello was seen (a TLS flow without SNI). Needs no `packets` and is not counted against the packet budget |
+| `pkt` | watched pid with `packets` (every frame) or `handshakes` (only frames that decode to a TLS ClientHello/ServerHello, DNS query/answer, HTTP request/response or decoded QUIC hello): max 200/s per client | `pid`, `t`, `dir`, `proto`, `lport`, `remote`, `port`, `host`, `len`, `flags`, `info` (the decode) |
 | `trace` | watched pid: process events | `kind` (`start` with `ppid`/`image`, `stop` with `exit_code`, `image` = DLL load) |
-| `capture` | a pcapng was closed | `path`, `pid`, `packets`, `bytes` |
+| `capture` | a pcapng was closed | `path`, `pid`, `packets`, `bytes`, `active` (captures still running) |
 | `killed`, `blocked`, `unblocked` | actions taken | `pid` / `path`, `by` |
 | `intruder` | a program was denied three times | `path`, `denials`, `firewall_blocked` |
 | `audit` | policy changed or repaired | `enabled`, `action` |
@@ -125,14 +139,14 @@ Commands:
 
 | command | reply |
 |---|---|
-| `status` | totals, rates, audit and capture state, thresholds, clients, trusted, blocked, history minutes, uptime |
+| `status` | totals, rates, audit, etw and zoom state, thresholds, clients, trusted, blocked, `captures` running (and `max_captures`, `max_watch`, `workers`), history minutes, uptime |
 | `whoami` / `clients` | your own identity / all connected clients |
 | `list` | every process seen with totals, rates, top remote, host, active connections, retransmitted bytes, failed connects, path |
-| `inspect <pid> [show]` | everything the Inspector shows: profile and signer, `conns[]` (state, RTT, retransmits, SNI, ALPN, TLS, QUIC, HTTP, connect time), last 100 `timeline[]` entries, last 100 `packets[]`, zoom state. `show` also opens (or raises) the Inspector window |
-| `conns [pid]` | connections of one process (seeded from the TCP table, with ESTATS) or of every process |
-| `watch <pid\|all> [packets]` / `watch <pid> off` / `watch off` / `watch` | stream `flow` and `trace` events for those processes; `packets` adds `pkt` events. Watching starts the zoom session |
-| `capture <pid\|all> [seconds] [file.pcapng]` / `capture stop` / `capture` | write that process's frames to a pcapng (default 30 s, `capture_<pid>_<time>.pcapng` next to the exe; a bare file name lands there too); JSON form `{"cmd":"capture","pid":N,"seconds":S,"path":"..."}`. A `capture` event follows when the file is closed |
-| `zoom` | zoom session state, frames seen / matched / unmatched, interest set, capture state |
+| `inspect <pid> [show]` | everything the Inspector shows: profile, signer and `sha256` of the executable, `conns[]` (state, RTT, retransmits, SNI, ALPN, TLS, QUIC, HTTP, connect time), last 100 `timeline[]` entries, last 100 `packets[]`, zoom state. `show` also opens (or raises) the Inspector window. Takes 0.3 to 1 s but runs on its own worker, so other clients are not held up |
+| `conns [pid\|all] [active] [since <now>] [cursor <n>] [limit <n>]` | connections of one process (seeded from the TCP table, with ESTATS) or of every process, up to 800 per reply. `active` drops closed and failed flows; `since <t>` keeps flows touched (bytes, connect, close) at or after `t`, where `t` is the `now` value of an earlier reply (a millisecond tick clock), so a poller sends `conns all since <last now>` and misses nothing; `cursor`/`limit` page: the reply carries `total` (flows that match), `count` (in this reply) and `next` (the cursor for the rest, or `null`). JSON form `{"cmd":"conns","pid":N,"active":true,"since":T,"cursor":N,"limit":N}` |
+| `watch <pid\|all> [packets\|handshakes\|nopackets]` / `watch <pid> off` / `watch off` / `watch packets\|handshakes\|nopackets` / `watch` | stream `flow`, `trace` and `flowinfo` events for those processes (64 per connection); `packets` adds a `pkt` event per frame, `handshakes` only the frames that decode to TLS, QUIC, DNS or HTTP handshakes. The bare mode word changes the mode of an existing watch. Reply: `watching[]`, `count`, `max`, `mode`, `packets`. Watching starts the zoom session |
+| `capture <pid\|all> [seconds] [file.pcapng]` / `capture stop [pid\|all]` / `capture` | write that process's frames to a pcapng (default 30 s, `capture_<pid>_<time>.pcapng` next to the exe; a bare file name lands there too); JSON form `{"cmd":"capture","pid":N,"seconds":S,"path":"..."}`. Up to four run at once, one per pid (`all` counts as one); starting one for a pid already being captured replaces that capture, a fifth is refused. `capture stop` ends every capture, `capture stop <pid>` one, `capture stop all` the `all` capture. `capture` shows the newest one in `active`/`pid`/`path`/`packets`/`bytes`/`seconds_left` and all of them in `captures[]` (`count`, `max`). A `capture` event follows each file that is closed |
+| `zoom` | zoom session state, frames seen / matched / unmatched, interest set, `captures` running |
 | `history [minutes]` | per-minute totals and top processes, up to 1440 minutes |
 | `kill <pid>` | `{"reply":"kill","ok":true|false,"error":"..."}` |
 | `block <pid|"path">` / `unblock <pid|"path">` / `blocks` | firewall block rules in and out for that program |
@@ -184,6 +198,10 @@ specification.
   recognised but not decrypted. ESTATS RTT and retransmit counters exist only for established TCP connections and start
   counting when the connection is first inspected.
 - Signer: Authenticode (embedded) or the Windows security catalog; the check runs on a worker thread, so the header says
-  "checking signature…" for a moment. GPU % needs the WDDM "GPU Engine" counters (Windows 10 1709+).
+  "checking signature…" for a moment. Results are cached per path and SHA-256 (64 entries), so repeated `inspect`s of
+  the same executable skip the catalog lookup; a changed file is checked again. GPU % needs the WDDM "GPU Engine"
+  counters (Windows 10 1709+).
+- Socket limits: 32 clients, 64 watched pids per client, 200 `pkt` events per second per client (use `handshakes` or
+  `flowinfo` to stay under it), 4 captures, 800 flows per `conns` reply (page with `cursor`), 128 queued commands.
 - The exe is linked statically (`-static`) so it needs no MinGW runtime DLLs; dark scrollbars and menus use the
   undocumented uxtheme dark-mode entry points (Windows 10 1809+; harmless if absent).

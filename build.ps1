@@ -1,4 +1,5 @@
-# Builds Hodometer.exe with MinGW-w64 (WinLibs). Run from any PowerShell:  .\build.ps1
+# Builds Hodometer.exe with MinGW-w64 (WinLibs). Run from any PowerShell:  .\build.ps1   (or  .\build.ps1 -Out Hodometer-new.exe  while Hodometer.exe is running)
+param([string]$Out = 'Hodometer.exe')
 $ErrorActionPreference = 'Stop'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $gcc = (Get-Command gcc -ErrorAction SilentlyContinue).Source
@@ -10,8 +11,8 @@ Push-Location $here
 try {
     if (Test-Path $windres) { & $windres app.rc -O coff -o app_res.o; if ($LASTEXITCODE) { throw "windres failed" } } else { Write-Warning 'windres not found: building without manifest (app will self-elevate, classic controls)'; Remove-Item app_res.o -ErrorAction SilentlyContinue }
     $objs = @('main.c'); if (Test-Path app_res.o) { $objs += 'app_res.o' }
-    & $gcc -O2 -Wall -Wno-unused-function -Wno-misleading-indentation -Wno-format-truncation -Wno-stringop-truncation -static -o Hodometer.exe $objs -lws2_32 -liphlpapi -ldnsapi -ladvapi32 -lshell32 -luser32 -lgdi32 -lcomctl32 -lole32 -lpsapi -lpdh -lwintrust -lcrypt32 -lbcrypt '-Wl,--subsystem,windows'
+    & $gcc -O2 -Wall -Wno-unused-function -Wno-misleading-indentation -Wno-format-truncation -Wno-stringop-truncation -static -o $Out $objs -lws2_32 -liphlpapi -ldnsapi -ladvapi32 -lshell32 -luser32 -lgdi32 -lcomctl32 -lole32 -lpsapi -lpdh -lwintrust -lcrypt32 -lbcrypt '-Wl,--subsystem,windows'
     if ($LASTEXITCODE) { throw "gcc failed ($LASTEXITCODE)" }
-    $f = Get-Item Hodometer.exe
+    $f = Get-Item $Out
     Write-Host "built $($f.FullName) ($([math]::Round($f.Length/1KB)) KB)"
 } finally { Pop-Location }

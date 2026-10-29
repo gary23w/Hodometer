@@ -10,6 +10,7 @@ blocked.jsonl
 snapshot*.bmp
 snapshot*.png
 screenshot*.png
+capture_*.pcapng
 hodometer.log
 Hodometer-1.1-backup.exe
 Hodometer-1.2.exe
@@ -17,3 +18,5 @@ Hodometer.exe
 
 # Local tool settings
 .claude/
+
+build/

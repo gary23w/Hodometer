@@ -1,0 +1,5 @@
+# the private Python copy and everything the daemon writes
+runtime/
+state/
+__pycache__/
+*.pyc
