@@ -1,0 +1,15 @@
+# Build output
+*.exe
+*.o
+
+# Runtime files the app writes next to the exe (traffic history, trusted/blocked programs, logs, captures)
+*.log
+history.jsonl
+trusted.jsonl
+blocked.jsonl
+snapshot*.bmp
+snapshot*.png
+screenshot*.png
+
+# Local tool settings
+.claude/
