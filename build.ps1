@@ -10,7 +10,7 @@ Push-Location $here
 try {
     if (Test-Path $windres) { & $windres app.rc -O coff -o app_res.o; if ($LASTEXITCODE) { throw "windres failed" } } else { Write-Warning 'windres not found: building without manifest (app will self-elevate, classic controls)'; Remove-Item app_res.o -ErrorAction SilentlyContinue }
     $objs = @('main.c'); if (Test-Path app_res.o) { $objs += 'app_res.o' }
-    & $gcc -O2 -Wall -Wno-unused-function -o Hodometer.exe $objs -lws2_32 -liphlpapi -ldnsapi -ladvapi32 -lshell32 -luser32 -lgdi32 -lcomctl32 -lole32 '-Wl,--subsystem,windows'
+    & $gcc -O2 -Wall -Wno-unused-function -Wno-misleading-indentation -Wno-format-truncation -Wno-stringop-truncation -static -o Hodometer.exe $objs -lws2_32 -liphlpapi -ldnsapi -ladvapi32 -lshell32 -luser32 -lgdi32 -lcomctl32 -lole32 -lpsapi -lpdh -lwintrust -lcrypt32 -lbcrypt '-Wl,--subsystem,windows'
     if ($LASTEXITCODE) { throw "gcc failed ($LASTEXITCODE)" }
     $f = Get-Item Hodometer.exe
     Write-Host "built $($f.FullName) ($([math]::Round($f.Length/1KB)) KB)"

@@ -1,9 +1,14 @@
-# Hodometer 1.1
+# Hodometer 1.2
 
 A single-file native Windows tray application (C, Win32, no runtime) that shows exactly which program is sending and
 receiving bytes and to which host, keeps Windows connection auditing switched on, lets you or an AI agent kill a
 process or block a program on the spot, and streams everything over a localhost socket that only programs you have
 explicitly allowed can use.
+
+1.2 adds the **Inspector**: zoom into one process and see its connections (state, RTT, retransmits, connect time),
+its packets decoded on the wire (TLS SNI/ALPN, QUIC, DNS, HTTP), a process profile (CPU, memory, disk, GPU, user,
+command line, signer) and a timeline (connects, failures, child processes, DLL loads), with pcapng export. All of it
+comes from Windows' own kernel providers and `ndiscap.sys`; there is no driver to install.
 
 ## What it does
 
@@ -28,6 +33,42 @@ explicitly allowed can use.
 - **Tray.** Left-click the icon to show or hide the window; right-click for pause, audit repair, forget trusted programs,
   log folder, README, exit. Closing or minimising hides to the tray; Exit is in the tray menu.
 
+## Inspector (zoom into a process)
+
+Double-click a row, press **Inspect selected process**, use the right-click menu, or send `inspect <pid> show` over the
+socket. Up to eight Inspector windows can be open; each follows one pid.
+
+- **Header.** Name, pid, running/exited/blocked, Authenticode signer (embedded signature, or the Windows catalog that
+  covers the file; "unsigned" and "signature not trusted" are called out), path, command line, user and integrity level,
+  parent, start time, children, threads, handles; CPU %, memory (working set and private), disk read/write rate, GPU %
+  (the per-process "GPU Engine" counters Task Manager uses), CPU time; bytes out/in with rates, active connections,
+  retransmitted bytes, failed connection attempts, packets seen; a two-minute rate graph for this process alone.
+- **Connections.** Every TCP connection and UDP flow of the process: remote host (DNS name, else the TLS SNI, else the
+  address), port, protocol, state (connecting / established / closed / failed, or udp / quic), rates and totals each way,
+  retransmitted bytes and packets, smoothed and minimum RTT, local port, age, and an info column with SNI, ALPN, TLS
+  version, HTTP request, QUIC version, connect time, reconnects, timeouts and congestion signals, MSS. Lifecycle and
+  retransmits come from the Kernel-Network provider (events 12-17 and their IPv6 twins), states are seeded from the TCP
+  table, RTT and retransmit counters from TCP ESTATS (enabled per connection while it is inspected).
+- **Packets.** Live list of the process's frames: time, direction, protocol, remote, length, TCP flags and a one-line
+  decode: TLS ClientHello with SNI and ALPN (reassembled across segments), ServerHello with the negotiated version, TLS
+  record types, plaintext HTTP request line and Host header, DNS queries and answers, QUIC version and packet type. For
+  QUIC v1 the client Initial is decrypted (its keys derive from the connection id alone, RFC 9001 5.2), so HTTP/3
+  connections show SNI and ALPN as well, even when Chrome scatters the ClientHello over many out-of-order CRYPTO
+  fragments. Payloads stay encrypted; nothing beyond the handshake is read.
+- **Timeline.** Connect / established (with connect latency) / closed / failed (with the Winsock error) / retransmit
+  bursts, TLS hellos, DNS queries, HTTP requests, QUIC hellos, child processes the inspected process started, image (DLL)
+  loads while inspected, process exit, finished captures.
+- **Capture 30 s → pcapng.** Writes just this process's frames to `capture_<name>_<pid>_<time>.pcapng` next to the exe;
+  opens in Wireshark. **Copy JSON** puts the whole Inspector state on the clipboard (the `inspect` reply). **Kill** and
+  **Block** act on this process.
+
+How it works: frames come from Windows' own `ndiscap.sys` (the Microsoft-Windows-NDIS-PacketCapture provider behind
+`netsh trace`) through a second ETW session, `HodometerZoom`, which runs only while an Inspector is open, a socket
+client is watching, or a capture is running (plus a 30 s grace period). Frames carry no process id; Hodometer attributes
+them by matching local and remote address and port against the connection table it builds from the kernel network
+events. That is how it does per-process packets, which pktmon and Wireshark cannot. Names learned from SNI also fill the
+main table's host column when DNS revealed nothing (browsers using DNS over HTTPS, for instance).
+
 ## Who may connect: the prompt
 
 Every new socket client is identified by its owning process (via the TCP table), its executable path and the file's
@@ -47,7 +88,8 @@ rejected. `pardon <substring>` clears a program's denial record and any firewall
 
 ## Install / run
 
-- `build.ps1` builds `Hodometer.exe` with MinGW-w64 (WinLibs gcc + windres).
+- `build.ps1` builds `Hodometer.exe` with MinGW-w64 (WinLibs gcc + windres); links ws2_32, iphlpapi, dnsapi, advapi32,
+  shell32, user32, gdi32, comctl32, ole32, psapi, pdh, wintrust, crypt32 and bcrypt, statically.
 - `install.ps1` (run as administrator once) registers the logon task **Hodometer** (elevated, no UAC prompt), puts a
   Desktop shortcut that starts that task, retires the older script watcher and starts the app.
 - Options: `--port N` (default 48201), `--tx MBPS`, `--rx MBPS`, `--auth-timeout SECONDS`, `--show`, `--local`,
@@ -66,14 +108,18 @@ Events:
 |---|---|---|
 | `auth` | on connect and on decisions | `status`: `pending`, `allowed` (+`remembered`), `denied`, `asking`, `abandoned`, `suspended` |
 | `hello` | once allowed | `version`, `port` |
-| `tick` | every second | `t`, `tx_mbps`, `rx_mbps`, `tx_total`, `rx_total`, `audit`, `etw`, `procs[]` (top 25 active: `pid`, `name`, `tx_bps`, `rx_bps`, `tx_total`, `rx_total`, `remote`, `host`, `blocked`, `vm`, `path`) |
+| `tick` | every second | `t`, `tx_mbps`, `rx_mbps`, `tx_total`, `rx_total`, `audit`, `etw`, `procs[]` (top 25 active: `pid`, `name`, `tx_bps`, `rx_bps`, `tx_total`, `rx_total`, `remote`, `host`, `blocked`, `vm`, `conns`, `retx`, `fails`, `path`) |
 | `spike` | burst over threshold (10 s hold) | `kind`, `tx_mbps`, `rx_mbps`, `top[]` |
 | `conn` | each outbound connection (Security 5156) | `pid`, `app`, `path` (NT device path), `dst`, `host`, `port`, `proto` |
+| `flow` | watched pid: connection lifecycle | `pid`, `kind` (`connect`, `established` +`connect_ms`, `closed` +`tx`/`rx`, `failed` +`error`, `retransmit` +`bytes`, `reconnect`), `proto`, `lport`, `remote`, `port`, `host` |
+| `pkt` | watched pid with `packets`: each frame (max 200/s per client) | `pid`, `t`, `dir`, `proto`, `lport`, `remote`, `port`, `host`, `len`, `flags`, `info` (the decode) |
+| `trace` | watched pid: process events | `kind` (`start` with `ppid`/`image`, `stop` with `exit_code`, `image` = DLL load) |
+| `capture` | a pcapng was closed | `path`, `pid`, `packets`, `bytes` |
 | `killed`, `blocked`, `unblocked` | actions taken | `pid` / `path`, `by` |
 | `intruder` | a program was denied three times | `path`, `denials`, `firewall_blocked` |
 | `audit` | policy changed or repaired | `enabled`, `action` |
 | `client` | a client was dropped | `status`, `why` |
-| `snap` | a window capture finished | `path`, `ok` |
+| `snap` | a window capture finished | `path`, `ok`, `window` (`main` or `inspector`) |
 
 Commands:
 
@@ -81,7 +127,12 @@ Commands:
 |---|---|
 | `status` | totals, rates, audit and capture state, thresholds, clients, trusted, blocked, history minutes, uptime |
 | `whoami` / `clients` | your own identity / all connected clients |
-| `list` | every process seen with totals, rates, top remote, host, path |
+| `list` | every process seen with totals, rates, top remote, host, active connections, retransmitted bytes, failed connects, path |
+| `inspect <pid> [show]` | everything the Inspector shows: profile and signer, `conns[]` (state, RTT, retransmits, SNI, ALPN, TLS, QUIC, HTTP, connect time), last 100 `timeline[]` entries, last 100 `packets[]`, zoom state. `show` also opens (or raises) the Inspector window |
+| `conns [pid]` | connections of one process (seeded from the TCP table, with ESTATS) or of every process |
+| `watch <pid\|all> [packets]` / `watch <pid> off` / `watch off` / `watch` | stream `flow` and `trace` events for those processes; `packets` adds `pkt` events. Watching starts the zoom session |
+| `capture <pid\|all> [seconds] [file.pcapng]` / `capture stop` / `capture` | write that process's frames to a pcapng (default 30 s, `capture_<pid>_<time>.pcapng` next to the exe; a bare file name lands there too); JSON form `{"cmd":"capture","pid":N,"seconds":S,"path":"..."}`. A `capture` event follows when the file is closed |
+| `zoom` | zoom session state, frames seen / matched / unmatched, interest set, capture state |
 | `history [minutes]` | per-minute totals and top processes, up to 1440 minutes |
 | `kill <pid>` | `{"reply":"kill","ok":true|false,"error":"..."}` |
 | `block <pid|"path">` / `unblock <pid|"path">` / `blocks` | firewall block rules in and out for that program |
@@ -90,7 +141,7 @@ Commands:
 | `resolve <ip>` | hostname from the DNS trace or PTR cache |
 | `audit` / `audit on` / `audit auto on|off` | audit state; `on` re-enables immediately |
 | `threshold <tx_mbps> [rx_mbps]`, `local on|off`, `pause on|off`, `reset`, `show` | settings and window |
-| `snap [file.bmp]` | capture the window to a bitmap (default `snapshot.bmp` next to the exe), so an agent can look at the GUI |
+| `snap [file.bmp] [pid]` | capture the main window, or the open Inspector of `pid`, to a bitmap (default `snapshot.bmp` next to the exe), so an agent can look at the GUI |
 | `help` | the list above |
 
 Example (PowerShell):
@@ -105,14 +156,34 @@ $w.WriteLine('status'); $r.ReadLine()
 
 `test_client.py` is a minimal Python client that prints events and sends commands once allowed.
 
+`SENTINEL.md` turns this socket into an always-on AI defense (written for Claude Sonnet): a non-AI daemon follows the
+whole stream and scores every process, a Sentinel coordinator reviews every process that reaches the internet, and
+parallel investigators hook suspicious processes, deep-dive their packets, and block or kill harmful process trees
+under hard limits. It contains both system prompts, the shared threat rubric, the Hodometer reference and the daemon
+specification.
+
 ## Files
 
-`hodometer.log` (start/stop, spikes, kills, blocks, audit repairs, auth decisions), `history.jsonl` (one line per
-minute), `trusted.jsonl`, `blocked.jsonl`, `install.log`, `snapshot.bmp` (on `snap`).
+`hodometer.log` (start/stop, spikes, kills, blocks, audit repairs, auth decisions, zoom session, captures), `history.jsonl`
+(one line per minute), `trusted.jsonl`, `blocked.jsonl`, `install.log`, `snapshot.bmp` (on `snap`), `capture_*.pcapng`
+(Inspector captures).
 
 ## Notes and limits
 
 - Bytes are counted at the kernel socket layer, so they match what left the machine.
 - Traffic from WSL or Hyper-V virtual machines is attributed to `System` or `vmmem` on the host (marked `vm`).
 - Blocking is by program path through Windows Firewall; there is no throttling.
-- The ETW session is `HodometerETW`; a crashed instance's session is replaced on the next start.
+- The ETW sessions are `HodometerETW` (always) and `HodometerZoom` (while inspecting); a crashed instance's sessions are
+  replaced on the next start.
+- Packet zoom reads frames at the NDIS layer, so loopback (127.0.0.1) traffic is not visible there; it still appears in
+  the connection list and byte counts. Native 802.11 frames are skipped (Wi-Fi adapters normally present Ethernet frames).
+  Frames are matched to a connection only after the kernel has reported that connection, so the first packet of a brand
+  new flow can be missed. On Hyper-V/WSL hosts the same frame can be seen on the virtual switch and the physical adapter;
+  only the first interface a flow is seen on is counted.
+- Decoding is handshake-only: TLS payloads and QUIC after the Initial are never decrypted. QUIC v2 and draft versions are
+  recognised but not decrypted. ESTATS RTT and retransmit counters exist only for established TCP connections and start
+  counting when the connection is first inspected.
+- Signer: Authenticode (embedded) or the Windows security catalog; the check runs on a worker thread, so the header says
+  "checking signature…" for a moment. GPU % needs the WDDM "GPU Engine" counters (Windows 10 1709+).
+- The exe is linked statically (`-static`) so it needs no MinGW runtime DLLs; dark scrollbars and menus use the
+  undocumented uxtheme dark-mode entry points (Windows 10 1809+; harmless if absent).
